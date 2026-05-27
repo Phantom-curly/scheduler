@@ -52,20 +52,25 @@ def _reminder_override(minutes: int) -> dict:
 
 
 def parse_event_start(event: dict) -> Optional[datetime]:
-    """Parse a Google Calendar event's start time into a naive local datetime."""
-    start = event.get("start", {})
-    dt_str = start.get("dateTime") or start.get("date")
+    """Parse a Google Calendar event's start time into a timezone-aware datetime."""
+    import pytz
+    tz       = pytz.timezone(os.getenv("TIMEZONE", "Asia/Seoul"))
+    start    = event.get("start", {})
+    dt_str   = start.get("dateTime") or start.get("date")
     if not dt_str:
         return None
     try:
         if "T" in dt_str:
             dt = datetime.fromisoformat(dt_str)
-            # Convert to naive (strip tz) for simple comparison
-            if dt.tzinfo is not None:
-                dt = dt.astimezone().replace(tzinfo=None)
+            if dt.tzinfo is None:
+                dt = tz.localize(dt)
+            else:
+                dt = dt.astimezone(tz)
             return dt
         else:
-            return datetime.fromisoformat(dt_str)
+            # All-day event — return as midnight in local tz
+            d  = datetime.fromisoformat(dt_str)
+            return tz.localize(d)
     except Exception:
         return None
 

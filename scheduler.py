@@ -167,12 +167,19 @@ async def calendar_reminders(app):
         logger.warning(f"calendar_reminders fetch error: {exc}")
         return
 
+    import pytz
+    tz        = pytz.timezone(TIMEZONE)
+    local_now = datetime.now(tz)
+
     for event in events:
         start = calendar_client.parse_event_start(event)
         if not start:
             continue
 
-        local_now     = datetime.now()
+        # Ensure start is tz-aware for comparison
+        if start.tzinfo is None:
+            start = tz.localize(start)
+
         minutes_until = (start - local_now).total_seconds() / 60
         if minutes_until < 0:
             continue
@@ -185,8 +192,9 @@ async def calendar_reminders(app):
         if abs(minutes_until - reminder_mins) > 1.5:
             continue
 
+        # Dedup key: per event per hour (prevents duplicate fires within same minute window)
         event_id = event["id"]
-        key      = f"cal:{event_id}:{local_now.strftime('%Y-%m-%d-%H-%M')}"
+        key      = f"cal:{event_id}:{start.strftime('%Y-%m-%d-%H')}"
         if db.reminder_already_sent(key):
             continue
         db.mark_reminder_sent(key)
