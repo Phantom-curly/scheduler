@@ -242,15 +242,11 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import pytz
     tz  = pytz.timezone(os.getenv("TIMEZONE", "Asia/Seoul"))
     now = datetime.now(tz)
+    date_str = now.strftime("%A, %B %d %Y")
+    time_str = now.strftime("%I:%M %p")
+    zone_str = now.strftime("%Z") + " (UTC" + now.strftime("%z") + ")"
     await update.message.reply_text(
-        f"🕐 *Bot's current time*
-
-"
-        f"Date: {now.strftime('%A, %B %d %Y')}
-"
-        f"Time: {now.strftime('%I:%M %p')}
-"
-        f"Zone: {now.strftime('%Z')} (UTC{now.strftime('%z')})",
+        f"\U0001f550 *Bot time*\n\nDate: {date_str}\nTime: {time_str}\nZone: {zone_str}",
         parse_mode="Markdown",
     )
 
