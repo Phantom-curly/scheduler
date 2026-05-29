@@ -236,6 +236,25 @@ async def cmd_habits(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    import pytz
+    tz  = pytz.timezone(os.getenv("TIMEZONE", "Asia/Seoul"))
+    now = datetime.now(tz)
+    await update.message.reply_text(
+        f"🕐 *Bot's current time*
+
+"
+        f"Date: {now.strftime('%A, %B %d %Y')}
+"
+        f"Time: {now.strftime('%I:%M %p')}
+"
+        f"Zone: {now.strftime('%Z')} (UTC{now.strftime('%z')})",
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
@@ -815,6 +834,7 @@ def main():
     app.add_handler(CommandHandler("week",     cmd_week))
     app.add_handler(CommandHandler("calendar", cmd_calendar))
     app.add_handler(CommandHandler("habits",   cmd_habits))
+    app.add_handler(CommandHandler("now",      cmd_now))
     app.add_handler(CommandHandler("cancel",   cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
