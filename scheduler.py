@@ -37,10 +37,13 @@ async def morning_briefing(app):
     if not chat_id:
         return
 
+    import pytz
+    tz    = pytz.timezone(TIMEZONE)
+    now   = datetime.now(tz)
     lines = ["☀️ *Good morning! Here's your day:*\n"]
 
     # Tasks due today
-    today = datetime.now().date()
+    today = now.date()
     tasks = db.get_tasks_by_period(today, today)
     if tasks:
         lines.append("📋 *Tasks due today:*")
@@ -87,7 +90,9 @@ async def evening_planning_prompt(app):
     if not chat_id:
         return
 
-    tomorrow = datetime.now().date() + timedelta(days=1)
+    import pytz
+    tz       = pytz.timezone(TIMEZONE)
+    tomorrow = datetime.now(tz).date() + timedelta(days=1)
     tasks    = db.get_tasks_by_period(tomorrow, tomorrow)
 
     lines = ["🌙 *Time to plan tomorrow!*\n"]
@@ -116,7 +121,9 @@ async def sunday_weekly_prompt(app):
     if not chat_id:
         return
 
-    today    = datetime.now().date()
+    import pytz
+    tz    = pytz.timezone(TIMEZONE)
+    today = datetime.now(tz).date()
     next_mon = today + timedelta(days=(7 - today.weekday()))
     next_sun = next_mon + timedelta(days=6)
     tasks    = db.get_tasks_by_period(next_mon, next_sun)
