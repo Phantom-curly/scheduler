@@ -254,8 +254,9 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
+    from telegram import ReplyKeyboardRemove
     context.user_data.clear()
-    await update.message.reply_text("❌ Cancelled.")
+    await update.message.reply_text("❌ Cancelled.", reply_markup=ReplyKeyboardRemove())
 
 
 # ── Main message router ────────────────────────────────────────────────────────
