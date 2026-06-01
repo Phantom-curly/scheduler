@@ -146,6 +146,37 @@ def delete_event(event_id: str):
     ).execute()
 
 
+def search_events_by_title(query: str, days_ahead: int = 14) -> list:
+    """Find calendar events whose title contains query (case-insensitive)."""
+    events = list_upcoming_events(days=days_ahead)
+    q = query.lower().strip()
+    return [e for e in events if q in e.get("summary", "").lower()]
+
+
+def reschedule_event(event_id: str, new_start: datetime, duration_minutes: int = None):
+    """Move an existing event to a new start time, preserving duration if not specified."""
+    service = _get_service()
+    event   = service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+
+    # Calculate original duration if not overriding
+    if duration_minutes is None:
+        try:
+            orig_start = datetime.fromisoformat(event["start"]["dateTime"])
+            orig_end   = datetime.fromisoformat(event["end"]["dateTime"])
+            duration_minutes = int((orig_end - orig_start).total_seconds() / 60)
+        except Exception:
+            duration_minutes = 60
+
+    new_end = new_start + timedelta(minutes=duration_minutes)
+    event["start"] = {"dateTime": new_start.isoformat(), "timeZone": TIMEZONE}
+    event["end"]   = {"dateTime": new_end.isoformat(),   "timeZone": TIMEZONE}
+
+    service.events().update(
+        calendarId=CALENDAR_ID, eventId=event_id, body=event
+    ).execute()
+    return duration_minutes
+
+
 # ── Read ───────────────────────────────────────────────────────────────────────
 
 def _local_day_bounds_utc() -> tuple:

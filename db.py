@@ -31,9 +31,9 @@ def init_db():
             CREATE TABLE IF NOT EXISTS habits (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 title      TEXT    NOT NULL,
-                frequency  TEXT    NOT NULL,  -- 'daily' | 'weekly'
-                count      INTEGER DEFAULT 1, -- how many times per week (weekly only)
-                notes      TEXT,              -- e.g. '30 min', 'x2'
+                frequency  TEXT    NOT NULL,
+                count      INTEGER DEFAULT 1,
+                notes      TEXT,
                 active     INTEGER DEFAULT 1,
                 created_at TEXT    DEFAULT (datetime('now'))
             )
@@ -49,7 +49,7 @@ def init_db():
         conn.commit()
 
 
-# ── Tasks ──────────────────────────────────────────────────────────────────────
+# ── Tasks: Create ──────────────────────────────────────────────────────────────
 
 def add_task(title, deadline=None, priority="medium", notes=None):
     with get_conn() as conn:
@@ -61,6 +61,8 @@ def add_task(title, deadline=None, priority="medium", notes=None):
         return cur.lastrowid
 
 
+# ── Tasks: Read ────────────────────────────────────────────────────────────────
+
 def get_task(task_id):
     with get_conn() as conn:
         return conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -70,16 +72,24 @@ def get_all_tasks(status=None):
     with get_conn() as conn:
         if status:
             return conn.execute(
-                "SELECT * FROM tasks WHERE status = ? ORDER BY deadline ASC, created_at ASC",
+                """SELECT * FROM tasks WHERE status = ?
+                   ORDER BY
+                     CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                     deadline ASC, created_at ASC""",
                 (status,),
             ).fetchall()
         return conn.execute(
-            "SELECT * FROM tasks ORDER BY deadline ASC, created_at ASC"
+            """SELECT * FROM tasks
+               ORDER BY
+                 CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                 deadline ASC, created_at ASC"""
         ).fetchall()
 
 
 def get_tasks_this_week():
-    today = datetime.now().date()
+    import pytz
+    tz    = pytz.timezone(os.getenv("TIMEZONE", "Asia/Seoul"))
+    today = datetime.now(tz).date()
     start = today - timedelta(days=today.weekday())
     end   = start + timedelta(days=6)
     return get_tasks_by_period(start, end)
@@ -91,8 +101,140 @@ def get_tasks_by_period(start_date, end_date):
             """SELECT * FROM tasks
                WHERE deadline BETWEEN ? AND ?
                  AND status != 'done'
-               ORDER BY deadline ASC""",
+               ORDER BY
+                 CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                 deadline ASC""",
             (start_date.isoformat(), end_date.isoformat()),
+        ).fetchall()
+
+
+def get_urgent_tasks(days_ahead=2):
+    """Tasks due within days_ahead that are not scheduled."""
+    import pytz
+    tz      = pytz.timezone(os.getenv("TIMEZONE", "Asia/Seoul"))
+    today   = datetime.now(tz).date()
+    cutoff  = today + timedelta(days=days_ahead)
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT * FROM tasks
+               WHERE deadline <= ?
+                 AND deadline >= ?
+                 AND status = 'pending'
+                 AND calendar_event_id IS NULL
+               ORDER BY deadline ASC""",
+            (cutoff.isoformat(), today.isoformat()),
+        ).fetchall()
+
+
+def get_completed_this_week():
+    """Tasks completed during this calendar week (Mon–Sun)."""
+    from datetime import datetime, timedelta
+    today = datetime.now().date()
+    start = today - timedelta(days=today.weekday())
+    end   = start + timedelta(days=6)
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT * FROM tasks
+               WHERE status = 'done'
+                 AND created_at >= ?
+               ORDER BY created_at DESC""",
+            (start.isoformat(),),
+        ).fetchall()
+
+
+def get_planned_this_week():
+    """All tasks that had a deadline this week (done or not)."""
+    from datetime import datetime, timedelta
+    today = datetime.now().date()
+    start = today - timedelta(days=today.weekday())
+    end   = start + timedelta(days=6)
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT * FROM tasks
+               WHERE deadline BETWEEN ? AND ?
+               ORDER BY deadline ASC""",
+            (start.isoformat(), end.isoformat()),
+        ).fetchall()
+
+
+def get_overdue_tasks():
+    """Tasks past their deadline that are still pending."""
+    from datetime import datetime
+    today = datetime.now().date().isoformat()
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT * FROM tasks
+               WHERE deadline < ?
+                 AND status != 'done'
+               ORDER BY deadline ASC""",
+            (today,),
+        ).fetchall()
+
+
+def get_completed_this_week():
+    """Tasks completed this week (Mon–Sun)."""
+    from datetime import datetime, timedelta
+    today = datetime.now().date()
+    start = today - timedelta(days=today.weekday())  # Monday
+    end   = start + timedelta(days=6)
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT * FROM tasks
+               WHERE status = 'done'
+                 AND deadline BETWEEN ? AND ?
+               ORDER BY deadline ASC""",
+            (start.isoformat(), end.isoformat()),
+        ).fetchall()
+
+
+def get_planned_this_week():
+    """All tasks (any status) that had deadlines this week."""
+    from datetime import datetime, timedelta
+    today = datetime.now().date()
+    start = today - timedelta(days=today.weekday())
+    end   = start + timedelta(days=6)
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT * FROM tasks
+               WHERE deadline BETWEEN ? AND ?
+               ORDER BY deadline ASC""",
+            (start.isoformat(), end.isoformat()),
+        ).fetchall()
+
+
+def get_urgent_tasks(days_ahead: int = 2):
+    """Tasks due within days_ahead that are not scheduled and not done."""
+    from datetime import datetime, timedelta
+    today    = datetime.now().date()
+    deadline = (today + timedelta(days=days_ahead)).isoformat()
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT * FROM tasks
+               WHERE deadline <= ?
+                 AND deadline >= ?
+                 AND status != 'done'
+                 AND calendar_event_id IS NULL
+               ORDER BY deadline ASC, priority DESC""",
+            (deadline, today.isoformat()),
+        ).fetchall()
+
+
+def get_unscheduled_tasks(status_filter=None):
+    """Tasks without a calendar event."""
+    with get_conn() as conn:
+        if status_filter:
+            return conn.execute(
+                """SELECT * FROM tasks WHERE calendar_event_id IS NULL
+                   AND status = ? ORDER BY
+                   CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                   deadline ASC NULLS LAST""",
+                (status_filter,),
+            ).fetchall()
+        return conn.execute(
+            """SELECT * FROM tasks WHERE calendar_event_id IS NULL
+               AND status != 'done' ORDER BY
+               CASE priority WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+               deadline ASC NULLS LAST"""
         ).fetchall()
 
 
@@ -103,6 +245,8 @@ def search_tasks(query):
             (f"%{query}%",),
         ).fetchall()
 
+
+# ── Tasks: Update ──────────────────────────────────────────────────────────────
 
 def update_task(task_id, **kwargs):
     if not kwargs:
@@ -119,6 +263,8 @@ def complete_task(task_id):
         conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
         conn.commit()
 
+
+# ── Tasks: Delete ──────────────────────────────────────────────────────────────
 
 def delete_task(task_id):
     with get_conn() as conn:
@@ -173,7 +319,7 @@ def toggle_habit(habit_id, active):
         conn.commit()
 
 
-# ── Sent reminders (for calendar event dedup) ──────────────────────────────────
+# ── Sent reminders ─────────────────────────────────────────────────────────────
 
 def reminder_already_sent(event_key):
     with get_conn() as conn:

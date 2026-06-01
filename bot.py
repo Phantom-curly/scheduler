@@ -64,11 +64,14 @@ def _fmt_dt(dt):
     return dt.strftime("%a %b %d, %I:%M %p").lstrip("0")
 
 
+PRIORITY_ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+
 def _fmt_task_row(idx, task):
-    icon    = STATUS_ICON.get(task["status"], "⏳")
-    cal_tag = " 📅" if task["calendar_event_id"] else ""
-    due_tag = f" — due {_fmt_deadline(task['deadline'])}" if task["deadline"] else ""
-    return f"{idx}. {icon} {task['title']}{due_tag}{cal_tag}"
+    icon     = STATUS_ICON.get(task["status"], "⏳")
+    p_icon   = PRIORITY_ICON.get(task["priority"] or "medium", "🟡")
+    cal_tag  = " 📅" if task["calendar_event_id"] else ""
+    due_tag  = f" — due {_fmt_deadline(task['deadline'])}" if task["deadline"] else ""
+    return f"{idx}. {icon}{p_icon} {task['title']}{due_tag}{cal_tag}"
 
 
 def _fmt_task_list(tasks):
@@ -282,6 +285,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == "updating":
         await _update_value(update, context, text)
         return
+    if state == "reschedule_pick":
+        # User picking which event to reschedule from a list
+        if text.strip().isdigit():
+            matches = context.user_data.get("reschedule_matches", [])
+            new_dt  = context.user_data.get("reschedule_new_dt")
+            n       = int(text.strip()) - 1
+            if 0 <= n < len(matches):
+                event = matches[n]
+                context.user_data["state"] = "idle"
+                if new_dt:
+                    await _do_reschedule(update, event, new_dt)
+                else:
+                    context.user_data["state"]            = "reschedule_time"
+                    context.user_data["reschedule_event"] = event
+                    await update.message.reply_text(
+                        f"New time for *{event.get('summary','Event')}*? "
+                        "(e.g. `tomorrow 6pm`)",
+                        parse_mode="Markdown",
+                    )
+            else:
+                await update.message.reply_text("Invalid number. Try again.")
+        else:
+            await update.message.reply_text("Reply with the number of the event.")
+        return
+
+    if state == "reschedule_time":
+        event  = context.user_data.get("reschedule_event")
+        new_dt = nlp.extract_datetime(text)
+        if not new_dt:
+            # Try with LLM
+            p = llm_client.parse(text)
+            if p:
+                new_dt = llm_client.normalise(p).get("datetime")
+        if not new_dt:
+            await update.message.reply_text(
+                "Couldn't parse that time. Try `tomorrow 6pm` or `Friday 10am`."
+            )
+            return
+        context.user_data["state"] = "idle"
+        await _do_reschedule(update, event, new_dt)
+        return
+
+    if state == "clarifying":
+        # User answered the clarification — re-parse with original + answer combined
+        original = context.user_data.pop("clarify_original", "")
+        context.user_data["state"] = "idle"
+        combined = f"{original} — {text}"
+        llm_result = llm_client.parse(combined)
+        if llm_result:
+            parsed2 = llm_client.normalise(llm_result)
+        else:
+            parsed2 = nlp.parse_message(combined)
+        intent2 = parsed2.get("intent", "unknown")
+        dispatch2 = {
+            "add": _add_task, "list": _list_tasks, "schedule": _schedule_intent,
+            "schedule_direct": _schedule_direct_intent, "complete": _complete_intent,
+            "delete": _delete_intent, "update": _update_intent,
+            "habit_add": _habit_add, "calendar_query": _calendar_query,
+        }
+        h2 = dispatch2.get(intent2)
+        if h2:
+            await h2(update, context, parsed2)
+        else:
+            await update.message.reply_text("Still not sure — try rephrasing or /help for examples.")
+        return
 
     # Try LLM first, fall back to regex if unavailable
     llm_result = llm_client.parse(text)
@@ -299,10 +367,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "complete":       _complete_intent,
         "delete":         _delete_intent,
         "update":         _update_intent,
+        "reschedule":     _reschedule_intent,
         "habit_add":      _habit_add,
         "habit_list":     lambda u, c, *_: cmd_habits(u, c),
         "habit_delete":   _habit_delete,
+        "calendar_query": _calendar_query,
         "help":           lambda u, c, *_: cmd_help(u, c),
+        "clarify":        _handle_clarify,
     }
 
     handler = dispatch.get(intent)
@@ -322,7 +393,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── ADD TASK ───────────────────────────────────────────────────────────────────
 
 async def _add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    title = parsed.get("title", "").strip()
+    # Multi-task add: "I have midterm Thursday and assignment due Friday"
+    titles    = parsed.get("titles")
+    deadlines = parsed.get("deadlines")
+    priority  = parsed.get("priority", "medium") or "medium"
+
+    if titles and len(titles) > 1:
+        added = []
+        for i, t in enumerate(titles):
+            dl  = deadlines[i] if deadlines and i < len(deadlines) else None
+            tid = db.add_task(title=t, deadline=dl, priority=priority)
+            due = f" — due {_fmt_deadline(dl)}" if dl else ""
+            added.append(f"  {PRIORITY_ICON[priority]} {t}{due} (#{tid})")
+        await update.message.reply_text(
+            f"✅ *{len(added)} tasks added!*\n\n" + "\n".join(added),
+            parse_mode="Markdown",
+        )
+        return
+
+    title = (parsed.get("title") or "").strip()
     dt    = parsed.get("datetime")
 
     if not title or len(title) < 2:
@@ -330,10 +419,12 @@ async def _add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: 
         return
 
     deadline_str = dt.date().isoformat() if dt else None
-    task_id      = db.add_task(title=title, deadline=deadline_str)
+    task_id      = db.add_task(title=title, deadline=deadline_str, priority=priority)
+    p_icon       = PRIORITY_ICON.get(priority, "🟡")
 
-    reply = f"✅ *Task added!*\n\n*{title}*\n"
-    reply += f"Due: {_fmt_deadline(deadline_str)}\n" if deadline_str else "No deadline set\n"
+    reply  = f"✅ *Task added!*\n\n{p_icon} *{title}*\n"
+    reply += f"Due: {_fmt_deadline(deadline_str)}\n" if deadline_str else "No deadline\n"
+    reply += f"Priority: {priority}\n"
     reply += f"ID: #{task_id}"
     await update.message.reply_text(reply, parse_mode="Markdown")
 
@@ -876,6 +967,122 @@ async def _habit_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, pars
         await update.message.reply_text(f"🗑 Deleted habit: *{habit['title']}*", parse_mode="Markdown")
     else:
         await update.message.reply_text("That number doesn't match. Check /habits.")
+
+
+# ── RESCHEDULE ────────────────────────────────────────────────────────────────
+
+async def _reschedule_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
+    """
+    Natural rescheduling: find a calendar event by title and move it.
+    e.g. "reschedule my gym to tomorrow 6pm"
+         "move Tuesday standup to Wednesday same time"
+         "push my report session to Friday"
+    """
+    raw   = parsed.get("raw", "")
+    title = parsed.get("title", "").strip()
+    dt    = parsed.get("datetime")
+
+    if not title:
+        await update.message.reply_text(
+            "Which event? E.g.\n"
+            "`reschedule gym to tomorrow 6pm`\n"
+            "`move standup to Wednesday same time`"
+        )
+        return
+
+    # Search calendar for matching events
+    try:
+        matches = calendar_client.search_events_by_title(title, days_ahead=14)
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Couldn't search calendar: {exc}")
+        return
+
+    if not matches:
+        await update.message.reply_text(
+            f"Couldn't find *{title}* in your calendar (next 14 days).\n"
+            "Try a different name or check /calendar.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # If multiple matches, ask which one
+    if len(matches) > 1:
+        lines = [f"Found {len(matches)} events matching *{title}*:\n"]
+        for i, e in enumerate(matches[:5]):
+            lines.append(f"  {i+1}. {e.get('summary','?')} — {calendar_client.fmt_event_time(e)}")
+        lines.append("\nReply with the number to reschedule.")
+        context.user_data["state"]             = "reschedule_pick"
+        context.user_data["reschedule_matches"]= matches[:5]
+        context.user_data["reschedule_new_dt"] = dt
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    # Single match
+    event = matches[0]
+    if not dt:
+        context.user_data["state"]              = "reschedule_time"
+        context.user_data["reschedule_event"]   = event
+        await update.message.reply_text(
+            f"📅 Moving *{event.get('summary','Event')}*\n"
+            f"Currently: {calendar_client.fmt_event_time(event)}\n\n"
+            "New time? (e.g. `tomorrow 6pm`, `Friday same time`)",
+            parse_mode="Markdown",
+        )
+        return
+
+    await _do_reschedule(update, event, dt)
+
+
+async def _do_reschedule(update, event: dict, new_dt: datetime):
+    try:
+        dur = calendar_client.reschedule_event(event["id"], new_dt)
+        end = new_dt + timedelta(minutes=dur)
+
+        # Also update task DB if this event is linked
+        with __import__("sqlite3").connect(__import__("os").getenv("DB_PATH", "planner.db")) as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            task = conn.execute(
+                "SELECT * FROM tasks WHERE calendar_event_id = ?", (event["id"],)
+            ).fetchone()
+            if task:
+                conn.execute(
+                    "UPDATE tasks SET scheduled_start=?, scheduled_end=? WHERE id=?",
+                    (new_dt.isoformat(), end.isoformat(), task["id"])
+                )
+                conn.commit()
+
+        title = event.get("summary", "Event")
+        await update.message.reply_text(
+            f"✅ *Rescheduled!*\n\n"
+            f"*{title}*\n"
+            f"New time: {_fmt_dt(new_dt)} → {end.strftime('%I:%M %p')}",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Reschedule failed: {exc}")
+
+
+# ── CALENDAR QUERY ────────────────────────────────────────────────────────────
+
+async def _calendar_query(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
+    query = parsed.get("query") or parsed.get("raw", "")
+    await update.message.reply_text("🔍 Let me check your calendar...", parse_mode="Markdown")
+    try:
+        events = calendar_client.list_upcoming_events(days=14)
+        tasks  = [dict(t) for t in db.get_all_tasks()]
+        answer = llm_client.answer_calendar_query(query, events, tasks)
+        await update.message.reply_text(f"📅 {answer}")
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Couldn't query calendar: {exc}")
+
+
+# ── CLARIFY ────────────────────────────────────────────────────────────────────
+
+async def _handle_clarify(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
+    question = parsed.get("clarify", "Could you be more specific?")
+    context.user_data["state"]            = "clarifying"
+    context.user_data["clarify_original"] = parsed.get("raw", "")
+    await update.message.reply_text(f"🤔 {question}")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

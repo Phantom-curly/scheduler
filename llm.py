@@ -1,77 +1,95 @@
 """
 LLM layer — Gemini 2.5 Flash Lite via OpenRouter.
 
-Single responsibility: parse a raw user message into structured JSON.
-Falls back to regex-based nlp.py if the API is unavailable.
-
-Token optimization:
-- System prompt is short and instruction-dense
-- Response is JSON only, no prose
-- max_tokens capped at 200
+Handles:
+- Complex multi-intent messages
+- Priority extraction
+- Clarification requests
+- Calendar queries
+- Minimal token output
 """
 
-import os
-import json
-import logging
-import re
+import os, json, logging, re
 from datetime import datetime
 from typing import Dict, Any, Optional
-
 import requests
 import dateparser
 
-logger = logging.getLogger(__name__)
-
+logger             = logging.getLogger(__name__)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 MODEL              = "google/gemini-2.5-flash-lite"
 API_URL            = "https://openrouter.ai/api/v1/chat/completions"
 
-# ── System prompt — kept minimal for cheap token usage ────────────────────────
 
-_TODAY = datetime.now().strftime("%Y-%m-%d %A")  # refreshed at module load
+# ── System prompt ─────────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = f"""You are a JSON extractor for a planning bot. Today: {_TODAY}.
-Output ONLY valid JSON. No prose, no markdown, no backticks.
+_SYSTEM = """\
+You are the NLP core of a personal planning Telegram bot. Extract structured intent from the user's message.
+Today: {today}. User timezone: Asia/Seoul.
 
-Intents: add_task | list_tasks | schedule_tasks | schedule_direct | complete | delete | update | habit_add | habit_list | habit_delete | help | unknown
+Output ONLY valid compact JSON — no prose, no markdown, no backticks.
 
-JSON schema:
-{{
+INTENTS:
+add_task | list_tasks | schedule_tasks | schedule_direct | complete | delete | update
+habit_add | habit_list | habit_delete | calendar_query | help | clarify | unknown
+
+SCHEMA (omit null fields):
+{
   "intent": string,
-  "title": string|null,           // task or event name, clean
-  "deadline": "YYYY-MM-DD"|null,  // for add_task
-  "slots": ["YYYY-MM-DDTHH:MM"]|null, // for schedule_direct, all time slots
-  "duration_minutes": int|null,   // default 60
-  "reminder_minutes": int|null,   // default 30
-  "rrule": string|null,           // RRULE string if recurring
-  "recurrence_summary": string|null, // human label e.g. "every Monday"
-  "frequency": "daily"|"weekly"|null, // for habits
-  "count": int|null,              // habit sessions per week
-  "notes": string|null,           // habit descriptor e.g. "30 min"
-  "task_numbers": [int]|null,     // for schedule/complete/delete/update
-  "period": "today"|"week"|"next_week"|"all"|null // for list_tasks
-}}
+  "title": string,              // clean event/task name
+  "titles": [string],           // multiple tasks in one message
+  "deadline": "YYYY-MM-DD",
+  "deadlines": ["YYYY-MM-DD"],  // one per title if different
+  "priority": "high"|"medium"|"low",  // infer from urgency words
+  "slots": ["YYYY-MM-DDTHH:MM"],      // ALL time slots for scheduling
+  "duration_minutes": int,
+  "reminder_minutes": int,
+  "rrule": string,              // RRULE:FREQ=... if recurring
+  "recurrence_summary": string,
+  "frequency": "daily"|"weekly",
+  "count": int,
+  "notes": string,
+  "task_numbers": [int],
+  "period": "today"|"week"|"next_week"|"all",
+  "query": string,              // for calendar_query: what user wants to know
+  "clarify": string             // question to ask user if intent truly unclear
+}
 
-Rules:
-- dates relative to today ({_TODAY})
-- omit null fields to save tokens
-- slots: always future datetimes, ISO format, no timezone
-- rrule: standard RRULE e.g. RRULE:FREQ=WEEKLY;BYDAY=MO,TU
+PRIORITY RULES:
+- "urgent","asap","immediately","critical","important" → high
+- "sometime","eventually","when I can","low priority" → low
+- default → medium
+
+MULTI-TASK RULES:
+- "I have a midterm Thursday and assignment due Friday" → titles=["Midterm","Assignment"] deadlines=[...]
+- "block 3h study Tuesday and Wednesday evening" → intent=schedule_direct slots=[both datetimes]
+
+RESCHEDULE: "reschedule X to Y", "move X to Y", "push X to Y" → intent=reschedule, title=event name, slots=[new datetime]
+
+CLARIFY ONLY when genuinely ambiguous (not just missing a time — that's normal).
+Example: "do the thing" → clarify="What task did you mean?"
+
+NEVER clarify just because a time is missing — smart scheduling will handle that.
 """
 
-# ── Main parser ────────────────────────────────────────────────────────────────
 
-def parse(text: str) -> Optional[Dict[str, Any]]:
+# ── Call ──────────────────────────────────────────────────────────────────────
+
+def parse(text: str, conversation_context: str = "") -> Optional[Dict[str, Any]]:
     """
-    Call Gemini via OpenRouter. Returns parsed dict or None on failure.
-    Caller should fall back to regex nlp.py if None is returned.
+    Call Gemini. Returns raw parsed dict or None on failure.
+    conversation_context: last bot message, helps resolve pronouns like "it","that".
     """
     if not OPENROUTER_API_KEY:
         return None
 
-    # Refresh today's date in system prompt each call (bot runs 24/7)
-    today = datetime.now().strftime("%Y-%m-%d %A")
-    system = _SYSTEM_PROMPT.replace(_TODAY, today)
+    today  = datetime.now().strftime("%Y-%m-%d %A")
+    system = _SYSTEM.format(today=today)
+
+    messages = [{"role": "system", "content": system}]
+    if conversation_context:
+        messages.append({"role": "assistant", "content": f"[prev: {conversation_context[:200]}]"})
+    messages.append({"role": "user", "content": text})
 
     try:
         resp = requests.post(
@@ -82,26 +100,19 @@ def parse(text: str) -> Optional[Dict[str, Any]]:
                 "HTTP-Referer":  "https://github.com/Phantom-curly/scheduler",
             },
             json={
-                "model":      MODEL,
-                "max_tokens": 200,
-                "temperature": 0,      # deterministic — cheaper, more consistent
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": text},
-                ],
+                "model":       MODEL,
+                "max_tokens":  250,
+                "temperature": 0,
+                "messages":    messages,
             },
-            timeout=8,
+            timeout=10,
         )
         resp.raise_for_status()
         raw = resp.json()["choices"][0]["message"]["content"].strip()
-
-        # Strip any accidental markdown fences
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
-
-        parsed = json.loads(raw)
+        parsed        = json.loads(raw)
         parsed["raw"] = text
         return parsed
-
     except requests.exceptions.Timeout:
         logger.warning("LLM timeout — falling back to regex")
         return None
@@ -110,27 +121,29 @@ def parse(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-# ── Normalise LLM output to match what bot.py expects ────────────────────────
+# ── Normalise ─────────────────────────────────────────────────────────────────
 
 def normalise(llm: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Map LLM JSON fields to the internal format bot.py uses.
-    Ensures missing fields get safe defaults.
-    """
+    """Map LLM output to the internal format bot.py expects."""
     out: Dict[str, Any] = {
-        "intent":      _map_intent(llm.get("intent", "unknown")),
-        "raw":         llm.get("raw", ""),
-        "title":       llm.get("title"),
-        "duration":    llm.get("duration_minutes") or 60,
-        "reminder":    llm.get("reminder_minutes") or 30,
-        "recurrence":  None,
-        "multi_slots": None,
-        "datetime":    None,
+        "intent":       _map_intent(llm.get("intent", "unknown")),
+        "raw":          llm.get("raw", ""),
+        "title":        llm.get("title"),
+        "titles":       llm.get("titles"),       # multi-task add
+        "deadlines":    llm.get("deadlines"),    # parallel to titles
+        "priority":     llm.get("priority", "medium"),
+        "duration":     llm.get("duration_minutes") or 60,
+        "reminder":     llm.get("reminder_minutes") or 30,
+        "recurrence":   None,
+        "multi_slots":  None,
+        "datetime":     None,
         "task_numbers": llm.get("task_numbers"),
-        "period":      llm.get("period"),
-        "frequency":   llm.get("frequency"),
-        "count":       llm.get("count") or 1,
-        "notes":       llm.get("notes"),
+        "period":       llm.get("period"),
+        "frequency":    llm.get("frequency"),
+        "count":        llm.get("count") or 1,
+        "notes":        llm.get("notes"),
+        "query":        llm.get("query"),
+        "clarify":      llm.get("clarify"),
     }
 
     # Recurrence
@@ -147,7 +160,7 @@ def normalise(llm: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             out["datetime"] = dateparser.parse(llm["deadline"])
 
-    # Slots for multi-slot direct scheduling
+    # Slots
     if llm.get("slots"):
         parsed_slots = []
         for s in llm["slots"]:
@@ -158,29 +171,81 @@ def normalise(llm: Dict[str, Any]) -> Dict[str, Any]:
                 if dt:
                     parsed_slots.append(dt)
         if len(parsed_slots) == 1:
-            out["datetime"]    = parsed_slots[0]
-            out["multi_slots"] = None
+            out["datetime"]   = parsed_slots[0]
         elif len(parsed_slots) > 1:
-            out["datetime"]    = parsed_slots[0]
-            out["multi_slots"] = parsed_slots
+            out["datetime"]   = parsed_slots[0]
+            out["multi_slots"]= parsed_slots
 
     return out
 
 
-def _map_intent(llm_intent: str) -> str:
-    """Map LLM intent names to internal bot.py intent names."""
-    mapping = {
-        "add_task":       "add",
-        "list_tasks":     "list",
-        "schedule_tasks": "schedule",
-        "schedule_direct":"schedule_direct",
-        "complete":       "complete",
-        "delete":         "delete",
-        "update":         "update",
-        "habit_add":      "habit_add",
-        "habit_list":     "habit_list",
-        "habit_delete":   "habit_delete",
-        "help":           "help",
-        "unknown":        "unknown",
-    }
-    return mapping.get(llm_intent, llm_intent)
+def _map_intent(i: str) -> str:
+    return {
+        "add_task":        "add",
+        "list_tasks":      "list",
+        "schedule_tasks":  "schedule",
+        "schedule_direct": "schedule_direct",
+        "complete":        "complete",
+        "delete":          "delete",
+        "update":          "update",
+        "reschedule":      "reschedule",
+        "habit_add":       "habit_add",
+        "habit_list":      "habit_list",
+        "habit_delete":    "habit_delete",
+        "calendar_query":  "calendar_query",
+        "clarify":         "clarify",
+        "help":            "help",
+        "unknown":         "unknown",
+    }.get(i, i)
+
+
+# ── Calendar query answerer ───────────────────────────────────────────────────
+
+def answer_calendar_query(query: str, events: list, tasks: list) -> str:
+    """
+    Use Gemini to answer a natural language question about the user's schedule.
+    e.g. "what's my busiest day?", "when am I free Thursday?"
+    """
+    if not OPENROUTER_API_KEY:
+        return "I can't answer calendar questions without the LLM configured."
+
+    today = datetime.now().strftime("%Y-%m-%d %A")
+
+    events_text = "\n".join(
+        f"- {e.get('summary','?')} at {e.get('start',{}).get('dateTime','?')}"
+        for e in events[:30]
+    ) or "No events."
+
+    tasks_text = "\n".join(
+        f"- {t['title']} due {t['deadline'] or 'no deadline'} [{t['status']}]"
+        for t in tasks[:20]
+    ) or "No tasks."
+
+    prompt = (
+        f"Today: {today}\n"
+        f"Calendar events:\n{events_text}\n\n"
+        f"Tasks:\n{tasks_text}\n\n"
+        f"Question: {query}\n\n"
+        "Answer in 2-3 sentences max. Be direct and specific."
+    )
+
+    try:
+        resp = requests.post(
+            API_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type":  "application/json",
+            },
+            json={
+                "model":       MODEL,
+                "max_tokens":  120,
+                "temperature": 0.3,
+                "messages":    [{"role": "user", "content": prompt}],
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        logger.warning(f"calendar_query LLM error: {exc}")
+        return "Couldn't analyse your calendar right now."

@@ -48,8 +48,11 @@ _INTENTS = {
     "delete": [
         r"\b(delete|remove|cancel|drop|erase|get rid of)\b",
     ],
+    "reschedule": [
+        r"\b(reschedule|move|push|shift)\b.{1,40}\b(to|for|on)\b.{1,30}\b(tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next|morning|evening|night|am|pm)\b",
+    ],
     "update": [
-        r"\b(update|edit|change|move|reschedule|rename|modify|push back|extend)\b",
+        r"\b(update|edit|change|rename|modify|extend)\b",
     ],
     "help": [
         r"\b(help|commands?|what can you|how do i)\b",
