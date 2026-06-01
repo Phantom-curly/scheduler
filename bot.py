@@ -27,7 +27,9 @@ from telegram.ext import (
 
 import db
 import nlp
+import llm as llm_client
 import calendar_client
+import smart_schedule
 from config    import TELEGRAM_TOKEN, ALLOWED_USER_ID
 from scheduler import setup_scheduler
 
@@ -281,7 +283,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _update_value(update, context, text)
         return
 
-    parsed = nlp.parse_message(text)
+    # Try LLM first, fall back to regex if unavailable
+    llm_result = llm_client.parse(text)
+    if llm_result:
+        parsed = llm_client.normalise(llm_result)
+    else:
+        parsed = nlp.parse_message(text)
     intent = parsed["intent"]
 
     dispatch = {
@@ -409,24 +416,58 @@ async def _ask_schedule_time(update: Update, context: ContextTypes.DEFAULT_TYPE)
     task     = db.get_task(task_ids[idx])
     total    = len(task_ids)
 
-    await update.message.reply_text(
-        f"⏰ *Schedule {idx+1}/{total}*\n\n"
-        f"Task: _{task['title']}_\n\n"
-        "When? (e.g. `Thursday 2pm for 2 hours remind me 40 mins before`)\n"
-        "_Type /cancel to stop._",
-        parse_mode="Markdown",
-    )
+    # Try smart suggestions
+    try:
+        free_slots = smart_schedule.get_free_slots(days_ahead=5, min_duration_min=60)
+        msg, best  = smart_schedule.build_suggestion_message(task["title"], 60, free_slots)
+        header     = f"⏰ *Schedule {idx+1}/{total}* — _{task['title']}_\n\n"
+        context.user_data["schedule_suggested"] = best
+        await update.message.reply_text(header + msg, parse_mode="Markdown")
+    except Exception:
+        context.user_data["schedule_suggested"] = None
+        await update.message.reply_text(
+            f"⏰ *Schedule {idx+1}/{total}*\n\n"
+            f"Task: _{task['title']}_\n\n"
+            "When? (e.g. `Thursday 2pm for 2 hours remind me 40 mins before`)\n"
+            "_Type /cancel to stop._",
+            parse_mode="Markdown",
+        )
 
 
 async def _scheduling_time(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    idx      = context.user_data["schedule_idx"]
-    task_ids = context.user_data["pending_schedule"]
-    task_id  = task_ids[idx]
-    task     = db.get_task(task_id)
+    idx       = context.user_data["schedule_idx"]
+    task_ids  = context.user_data["pending_schedule"]
+    task_id   = task_ids[idx]
+    task      = db.get_task(task_id)
+    suggested = context.user_data.get("schedule_suggested")
 
-    dt = nlp.extract_datetime(text)
+    # Confirmed suggested slot
+    if suggested and text.lower().strip() in ("yes", "y", "yep", "sure", "ok", "confirm"):
+        dt = suggested["start"]
+    # Rejected — ask plainly
+    elif suggested and text.lower().strip() in ("no", "n", "nope"):
+        context.user_data["schedule_suggested"] = None
+        await update.message.reply_text(
+            f"When would you like to schedule _{task['title']}_?\n"
+            "(e.g. `Thursday 2pm for 2 hours`)",
+            parse_mode="Markdown",
+        )
+        return
+    # Numbered slot pick
+    elif re.match(r"^\d+$", text.strip()):
+        try:
+            free_slots = smart_schedule.get_free_slots(days_ahead=5, min_duration_min=60)
+            n = int(text.strip()) - 1
+            dt = free_slots[n]["start"] if 0 <= n < len(free_slots) else None
+        except Exception:
+            dt = None
+        if not dt:
+            dt = nlp.extract_datetime(text)
+    else:
+        dt = nlp.extract_datetime(text)
+
     if not dt:
-        await update.message.reply_text("Couldn't parse that. Try `Thursday 2pm` or `May 30 at 10am`")
+        await update.message.reply_text("Couldn't parse that. Try `Thursday 2pm`, pick a number, or `yes` to confirm.")
         return
 
     duration  = nlp.extract_duration(text)
@@ -496,18 +537,27 @@ async def _schedule_direct_intent(update: Update, context: ContextTypes.DEFAULT_
         await _do_direct_schedule(update, title, dt, duration, reminder, recurrence)
         return
 
-    # No time — ask for it
+    # No time — use smart scheduling to suggest slots
     context.user_data["state"]             = "schedule_direct"
     context.user_data["direct_title"]      = title
     context.user_data["direct_recurrence"] = recurrence
     context.user_data["direct_reminder"]   = reminder
     context.user_data["direct_duration"]   = duration
-    recap = f"_{recurrence['summary']}_" if recurrence else "once"
-    await update.message.reply_text(
-        f"📅 Scheduling: *{title}* ({recap})\n\n"
-        "When? (e.g. `Wednesday 9pm for 1 hour` or `tuesday 10pm and friday 9am`)",
-        parse_mode="Markdown",
-    )
+    context.user_data["direct_suggested"]  = None
+
+    try:
+        free_slots = smart_schedule.get_free_slots(days_ahead=5, min_duration_min=duration)
+        msg, best  = smart_schedule.build_suggestion_message(title, duration, free_slots)
+        if best:
+            context.user_data["direct_suggested"] = best
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception:
+        recap = f"_{recurrence['summary']}_" if recurrence else "once"
+        await update.message.reply_text(
+            f"📅 Scheduling: *{title}* ({recap})\n\n"
+            "When? (e.g. `Wednesday 9pm for 1 hour` or `tuesday 10pm and friday 9am`)",
+            parse_mode="Markdown",
+        )
 
 
 async def _schedule_direct_time(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -515,6 +565,40 @@ async def _schedule_direct_time(update: Update, context: ContextTypes.DEFAULT_TY
     recurrence = context.user_data.get("direct_recurrence")
     reminder   = nlp.extract_reminder_minutes(text) or context.user_data.get("direct_reminder", 30)
     duration   = nlp.extract_duration(text) or context.user_data.get("direct_duration", 60)
+    suggested  = context.user_data.get("direct_suggested")
+
+    # User confirmed the suggested slot
+    if suggested and text.lower().strip() in ("yes", "y", "yep", "sure", "ok", "confirm"):
+        context.user_data["state"] = "idle"
+        await _do_direct_schedule(update, title, suggested["start"], duration, reminder, recurrence)
+        return
+
+    # User said no — show more options
+    if suggested and text.lower().strip() in ("no", "n", "nope", "other", "other options"):
+        context.user_data["direct_suggested"] = None
+        try:
+            free_slots = smart_schedule.get_free_slots(days_ahead=7, min_duration_min=duration)
+            slots_text = smart_schedule.format_slots_for_display(free_slots, limit=6)
+            await update.message.reply_text(
+                f"📅 Here are your free slots for *{title}*:\n\n{slots_text}\n\n"
+                "Reply with a number or type a specific time.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            await update.message.reply_text("When would you like to schedule it?")
+        return
+
+    # User picked a numbered slot from the list
+    if re.match(r"^\d+$", text.strip()):
+        try:
+            free_slots = smart_schedule.get_free_slots(days_ahead=7, min_duration_min=duration)
+            n = int(text.strip()) - 1
+            if 0 <= n < len(free_slots):
+                context.user_data["state"] = "idle"
+                await _do_direct_schedule(update, title, free_slots[n]["start"], duration, reminder, recurrence)
+                return
+        except Exception:
+            pass
 
     # Check for multi-slot reply
     multi_slots = nlp.extract_multi_slots(text)
@@ -526,7 +610,7 @@ async def _schedule_direct_time(update: Update, context: ContextTypes.DEFAULT_TY
     dt = nlp.extract_datetime(text)
     if not dt:
         await update.message.reply_text(
-            "Couldn't parse that. Try `Wednesday 9pm` or `tuesday 10pm and friday 9am`"
+            "Couldn't parse that. Try `Wednesday 9pm`, pick a slot number, or reply `yes` to confirm the suggestion."
         )
         return
 
