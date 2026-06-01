@@ -148,11 +148,27 @@ def delete_event(event_id: str):
 
 # ── Read ───────────────────────────────────────────────────────────────────────
 
+def _local_day_bounds_utc() -> tuple:
+    """Return (day_start_iso, day_end_iso) in UTC for today in local TIMEZONE."""
+    import pytz
+    tz        = pytz.timezone(TIMEZONE)
+    local_now = datetime.now(tz)
+    day_start = local_now.replace(hour=0,  minute=0,  second=0,  microsecond=0)
+    day_end   = local_now.replace(hour=23, minute=59, second=59, microsecond=0)
+    day_start_utc = day_start.astimezone(pytz.utc)
+    day_end_utc   = day_end.astimezone(pytz.utc)
+    return (
+        day_start_utc.isoformat().replace("+00:00", "Z"),
+        day_end_utc.isoformat().replace("+00:00", "Z"),
+    )
+
+
 def list_upcoming_events(days: int = 7) -> List[dict]:
+    from datetime import timezone
     service  = _get_service()
-    now      = datetime.utcnow()
-    time_min = now.isoformat() + "Z"
-    time_max = (now + timedelta(days=days)).isoformat() + "Z"
+    now      = datetime.now(timezone.utc)
+    time_min = now.isoformat().replace("+00:00", "Z")
+    time_max = (now + timedelta(days=days)).isoformat().replace("+00:00", "Z")
 
     result = service.events().list(
         calendarId  = CALENDAR_ID,
@@ -165,15 +181,13 @@ def list_upcoming_events(days: int = 7) -> List[dict]:
 
 
 def get_todays_events() -> List[dict]:
-    service  = _get_service()
-    now      = datetime.utcnow()
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    service                    = _get_service()
+    day_start_iso, day_end_iso = _local_day_bounds_utc()
 
     result = service.events().list(
         calendarId  = CALENDAR_ID,
-        timeMin     = day_start.isoformat() + "Z",
-        timeMax     = day_end.isoformat()   + "Z",
+        timeMin     = day_start_iso,
+        timeMax     = day_end_iso,
         singleEvents= True,
         orderBy     = "startTime",
     ).execute()
@@ -182,10 +196,11 @@ def get_todays_events() -> List[dict]:
 
 def get_events_starting_soon(window_minutes: int = 35) -> List[dict]:
     """Return events whose start time is within the next window_minutes."""
+    from datetime import timezone
     service  = _get_service()
-    now      = datetime.utcnow()
-    time_min = now.isoformat() + "Z"
-    time_max = (now + timedelta(minutes=window_minutes)).isoformat() + "Z"
+    now      = datetime.now(timezone.utc)
+    time_min = now.isoformat().replace("+00:00", "Z")
+    time_max = (now + timedelta(minutes=window_minutes)).isoformat().replace("+00:00", "Z")
 
     result = service.events().list(
         calendarId  = CALENDAR_ID,
