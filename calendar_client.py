@@ -111,6 +111,30 @@ def create_event(
     return event["id"]
 
 
+def create_reminder(title: str, remind_at: datetime, rrule: str = None) -> str:
+    """
+    Create a reminder-style calendar event:
+    - 15 min duration
+    - Popup fires at exactly the start time (0 min before)
+    - Prefixed with 🔔 so it's visually distinct
+    """
+    service = _get_service()
+    end     = remind_at + timedelta(minutes=15)
+    body = {
+        "summary":   f"🔔 {title}",
+        "start":     {"dateTime": remind_at.isoformat(), "timeZone": TIMEZONE},
+        "end":       {"dateTime": end.isoformat(),       "timeZone": TIMEZONE},
+        "reminders": {
+            "useDefault": False,
+            "overrides":  [{"method": "popup", "minutes": 0}],
+        },
+    }
+    if rrule:
+        body["recurrence"] = [rrule]
+    event = service.events().insert(calendarId=CALENDAR_ID, body=body).execute()
+    return event["id"]
+
+
 # ── Update ─────────────────────────────────────────────────────────────────────
 
 def update_event(

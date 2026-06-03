@@ -64,6 +64,7 @@ MULTI-TASK RULES:
 - "I have a midterm Thursday and assignment due Friday" → titles=["Midterm","Assignment"] deadlines=[...]
 - "block 3h study Tuesday and Wednesday evening" → intent=schedule_direct slots=[both datetimes]
 
+REMINDER: "remind me to X at Y", "remind me tomorrow 4pm to X", "set reminder for X" → intent=reminder, title=X (what to be reminded of), slots=[reminder datetime]
 RESCHEDULE: "reschedule X to Y", "move X to Y", "push X to Y" → intent=reschedule, title=event name, slots=[new datetime]
 
 CLARIFY ONLY when genuinely ambiguous (not just missing a time — that's normal).
@@ -153,12 +154,20 @@ def normalise(llm: Dict[str, Any]) -> Dict[str, Any]:
             "summary": llm.get("recurrence_summary", "recurring"),
         }
 
-    # Deadline → datetime
+    # Deadline → datetime (LLM field takes priority, raw text as fallback)
     if llm.get("deadline"):
         try:
             out["datetime"] = datetime.fromisoformat(llm["deadline"])
         except Exception:
-            out["datetime"] = dateparser.parse(llm["deadline"])
+            out["datetime"] = dateparser.parse(llm["deadline"], settings={"PREFER_DATES_FROM": "future"})
+
+    # If LLM missed the deadline, try extracting from raw text
+    if out["datetime"] is None and llm.get("raw") and out["intent"] == "add":
+        try:
+            import nlp as _nlp
+            out["datetime"] = _nlp.extract_datetime(llm["raw"])
+        except Exception:
+            pass
 
     # Slots
     if llm.get("slots"):
@@ -189,6 +198,7 @@ def _map_intent(i: str) -> str:
         "delete":          "delete",
         "update":          "update",
         "reschedule":      "reschedule",
+        "reminder":        "reminder",
         "habit_add":       "habit_add",
         "habit_list":      "habit_list",
         "habit_delete":    "habit_delete",

@@ -4,7 +4,7 @@ NLP helpers — intent detection, datetime/duration/reminder/recurrence extracti
 
 import re
 import dateparser
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 
 # ── Intent patterns (order matters — more specific first) ──────────────────────
@@ -32,9 +32,13 @@ _INTENTS = {
         r"\bschedule\b\s*[\d\s,and]+$",
         r"\bschedule\s+\d",
     ],
+    "reminder": [
+        r"\bremind\s+me\b",
+        r"\bset\s+(a\s+)?reminder\b",
+        r"\breminder\s*(for|to|at|on)\b",
+    ],
     "add": [
         r"\b(add|create|new|track|save|log|set)\b",
-        r"\b(remind me (about|to))\b",
     ],
     "list": [
         r"\b(list|show|what|display|see|view|check)\b.{0,30}\b(tasks?|todo|deadlines?|week|today|upcoming|schedule)\b",
@@ -60,7 +64,10 @@ _INTENTS = {
 }
 
 _DEADLINE_HINTS = re.compile(
-    r"\b(by|due|deadline|before|until)\s+\w", re.IGNORECASE
+    r"\b(by|due|deadline|before|until|on)\s+\w"
+    r"|\b(this|next|coming)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"|\bI\s+have\s+.{1,30}\b(?:on|this|next)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)",
+    re.IGNORECASE
 )
 
 # ── Recurrence ─────────────────────────────────────────────────────────────────
@@ -138,12 +145,123 @@ def detect_intent(text: str) -> str:
     return "unknown"
 
 
+# ── Day name helpers ──────────────────────────────────────────────────────────
+
+_DAYS = {
+    "monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6,
+    "mon":0,"tue":1,"wed":2,"thu":3,"fri":4,"sat":5,"sun":6,
+}
+_NEXT_RE  = re.compile(r"^next\s+(\w+)$",    re.I)
+_THIS_RE  = re.compile(r"^this\s+(\w+)$",    re.I)
+_PLAIN_RE = re.compile(r"^(mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)$", re.I)
+
+
+def _next_weekday(name: str, force_next: bool = False) -> datetime:
+    today      = datetime.now()
+    target     = _DAYS[name.lower()]
+    days_ahead = (target - today.weekday()) % 7
+    if days_ahead == 0 or force_next:
+        days_ahead += 7
+    return today + timedelta(days=days_ahead)
+
+
+def _parse_date_phrase(phrase: str) -> Optional[datetime]:
+    phrase = phrase.strip()
+    m = _NEXT_RE.match(phrase)
+    if m and m.group(1).lower() in _DAYS:
+        return _next_weekday(m.group(1), force_next=True)
+    m = _THIS_RE.match(phrase)
+    if m and m.group(1).lower() in _DAYS:
+        return _next_weekday(m.group(1), force_next=False)
+    m = _PLAIN_RE.match(phrase)
+    if m:
+        return _next_weekday(m.group(1))
+    if phrase.lower() == "tomorrow":
+        return datetime.now() + timedelta(days=1)
+    if phrase.lower() in ("today", "tonight"):
+        return datetime.now()
+    return dateparser.parse(phrase, settings={"PREFER_DATES_FROM": "future", "PREFER_DAY_OF_MONTH": "first"})
+
+
+# Explicit marker: by/due/before/until/on/for + date phrase
+_DATE_MARKER_RE = re.compile(
+    r"(?:by|due|before|until|for)\s+"
+    r"("
+    r"(?:next\s+|this\s+|coming\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)"
+    r"(?:\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?"
+    r"|tomorrow|today|tonight|eod"
+    r"|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:\s+\d{4})?"
+    r"|\d{1,2}\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+\d{4})?"
+    r"|\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?"
+    r")",
+    re.IGNORECASE,
+)
+
+# "on [day]" with word boundary
+_ON_DAY_RE = re.compile(
+    r"\bon\s+((?:next\s+|this\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun))\b",
+    re.IGNORECASE,
+)
+
+# Bare date reference (no marker)
+_BARE_DATE_RE = re.compile(
+    r"\b((?:next\s+|this\s+|coming\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)"
+    r"|tomorrow|today|tonight"
+    r"|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:\s+\d{4})?)\b",
+    re.IGNORECASE,
+)
+
+
+# Day+time together (for reminders): "tomorrow 4pm", "Monday 9am"
+_DAY_WITH_TIME_RE = re.compile(
+    r"((?:next\s+|this\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today)"
+    r"\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b"
+    r"|(?:tomorrow|today)\s+(?:morning|afternoon|evening|night))",
+    re.IGNORECASE,
+)
+
+# Relative time: "in 2 hours", "in 30 minutes"
+_RELATIVE_TIME_RE = re.compile(
+    r"\bin\s+(\d+)\s*(hours?|hrs?|minutes?|mins?)\b",
+    re.IGNORECASE,
+)
+
 def extract_datetime(text: str) -> Optional[datetime]:
-    return dateparser.parse(text, settings={
-        "PREFER_DATES_FROM": "future",
-        "RETURN_AS_TIMEZONE_AWARE": False,
-        "PREFER_DAY_OF_MONTH": "first",
-    })
+    """Robust datetime extraction with multiple fallback strategies."""
+    # 0. Day + time together (e.g. "tomorrow 4pm", "Monday 9am")
+    m = _DAY_WITH_TIME_RE.search(text)
+    if m:
+        dt = dateparser.parse(m.group(1), settings={"PREFER_DATES_FROM": "future"})
+        if dt:
+            return dt
+    # 0b. Relative time ("in 2 hours", "in 30 minutes")
+    m = _RELATIVE_TIME_RE.search(text)
+    if m:
+        from datetime import timedelta as _td
+        amount = int(m.group(1))
+        unit   = m.group(2).lower()
+        delta  = _td(hours=amount) if "h" in unit else _td(minutes=amount)
+        return datetime.now() + delta
+    # 1. Explicit markers (by/due/before/until/for + date)
+    m = _DATE_MARKER_RE.search(text)
+    if m:
+        dt = _parse_date_phrase(m.group(1))
+        if dt:
+            return dt
+    # 2. "on [weekday]" with word boundary
+    m = _ON_DAY_RE.search(text)
+    if m:
+        dt = _parse_date_phrase(m.group(1))
+        if dt:
+            return dt
+    # 3. Bare day/date references
+    m = _BARE_DATE_RE.search(text)
+    if m:
+        dt = _parse_date_phrase(m.group(1))
+        if dt:
+            return dt
+    # 4. Full text fallback
+    return dateparser.parse(text, settings={"PREFER_DATES_FROM": "future", "PREFER_DAY_OF_MONTH": "first"})
 
 
 def extract_duration(text: str) -> int:
@@ -258,6 +376,36 @@ def extract_multi_slots(text: str) -> Optional[list]:
     return parsed if len(parsed) >= 2 else None
 
 
+def extract_reminder_title(text: str) -> str:
+    """Extract what the reminder is about from natural language."""
+    t = text.strip()
+
+    # "remind me [time] to/about X"
+    m = re.search(r"remind\s+me\b.{0,40}?\b(?:to|about|that)\s+(.+?)(?:\s+(?:by|before|on|at|tomorrow|today|next|this|\d).*)?$", t, re.IGNORECASE)
+    if m:
+        title = re.sub(r"\s+(?:by|before|at|on)\s+.+$", "", m.group(1), flags=re.IGNORECASE).strip(" .,")
+        if len(title) > 2:
+            return title.capitalize()
+
+    # "set a reminder (for/to) ... to/about X"
+    m = re.search(r"(?:set\s+(?:a\s+)?reminder\s+(?:for|to))\s+.{0,30}?\s+(?:to|about)\s+(.+)$", t, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().capitalize()
+
+    # "remind me to X"
+    m = re.search(r"remind\s+me\s+(?:to|about)\s+(.+)$", t, re.IGNORECASE)
+    if m:
+        return re.sub(r"\s+(?:by|before|at|on)\s+.+$", "", m.group(1), flags=re.IGNORECASE).strip(" .,").capitalize()
+
+    # Fallback: strip noise
+    cleaned = re.sub(r"\b(remind(?:\s+me)?|set\s+a\s+reminder(?:\s+for)?)\b", "", t, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(tomorrow|today|tonight|next\s+\w+|this\s+\w+)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\d{1,2}(?::\d{2})?\s*(?:am|pm)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(to|about|that|for|at|by)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" .,")
+    return cleaned.capitalize() if cleaned else t
+
+
 def parse_message(text: str) -> Dict:
     intent = detect_intent(text)
     result: Dict = {"intent": intent, "raw": text}
@@ -269,6 +417,12 @@ def parse_message(text: str) -> Dict:
         result["reminder"]    = extract_reminder_minutes(text)
         result["recurrence"]  = extract_recurrence(text)
         result["multi_slots"] = extract_multi_slots(text)
+
+    if intent == "reminder":
+        result["datetime"]   = extract_datetime(text)
+        result["title"]      = extract_reminder_title(text)
+        result["recurrence"] = extract_recurrence(text)
+        result["duration"]   = 15  # short block, just a notification
 
     if intent == "habit_add":
         result["title"]     = extract_habit_title(text)

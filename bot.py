@@ -285,6 +285,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == "updating":
         await _update_value(update, context, text)
         return
+    if state == "reminder_time":
+        pending  = context.user_data.pop("pending_reminder", {})
+        title    = pending.get("title", "Reminder")
+        recurrence = pending.get("recurrence")
+        dt       = nlp.extract_datetime(text)
+        if not dt:
+            # Try LLM
+            p2 = llm_client.parse(text)
+            if p2:
+                dt = llm_client.normalise(p2).get("datetime")
+        if not dt:
+            await update.message.reply_text("Couldn't parse that time. Try `tomorrow 4pm` or `Monday 9am`.")
+            # Put it back
+            context.user_data["pending_reminder"] = pending
+            return
+        context.user_data["state"] = "idle"
+        await _do_create_reminder(update, title, dt, recurrence)
+        return
+
     if state == "reschedule_pick":
         # User picking which event to reschedule from a list
         if text.strip().isdigit():
@@ -371,6 +390,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "habit_add":      _habit_add,
         "habit_list":     lambda u, c, *_: cmd_habits(u, c),
         "habit_delete":   _habit_delete,
+        "reminder":       _reminder_intent,
         "calendar_query": _calendar_query,
         "help":           lambda u, c, *_: cmd_help(u, c),
         "clarify":        _handle_clarify,
@@ -392,7 +412,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── ADD TASK ───────────────────────────────────────────────────────────────────
 
+_DEADLINE_CLARIFICATION_RE = re.compile(
+    r"^(?:deadline\s+is|due|by|it'?s?\s+due)\s+(.+)$",
+    re.IGNORECASE,
+)
+
+
 async def _add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
+    # Check if this looks like a deadline clarification for the last added task
+    raw = parsed.get("raw", "")
+    m   = _DEADLINE_CLARIFICATION_RE.match(raw.strip())
+    last_task_id = context.user_data.get("last_added_task_id")
+
+    if m and last_task_id:
+        # User is clarifying the deadline of the previous task
+        task = db.get_task(last_task_id)
+        if task and not task["deadline"]:
+            dt = parsed.get("datetime")
+            if dt:
+                deadline_str = dt.date().isoformat()
+                db.update_task(last_task_id, deadline=deadline_str)
+                await update.message.reply_text(
+                    f"✏️ Updated deadline for *{task['title']}*: {_fmt_deadline(deadline_str)}",
+                    parse_mode="Markdown",
+                )
+                context.user_data.pop("last_added_task_id", None)
+                return
+
     # Multi-task add: "I have midterm Thursday and assignment due Friday"
     titles    = parsed.get("titles")
     deadlines = parsed.get("deadlines")
@@ -422,8 +468,14 @@ async def _add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: 
     task_id      = db.add_task(title=title, deadline=deadline_str, priority=priority)
     p_icon       = PRIORITY_ICON.get(priority, "🟡")
 
+    # Store for potential deadline clarification follow-up
+    if not deadline_str:
+        context.user_data["last_added_task_id"] = task_id
+    else:
+        context.user_data.pop("last_added_task_id", None)
+
     reply  = f"✅ *Task added!*\n\n{p_icon} *{title}*\n"
-    reply += f"Due: {_fmt_deadline(deadline_str)}\n" if deadline_str else "No deadline\n"
+    reply += f"Due: {_fmt_deadline(deadline_str)}\n" if deadline_str else "No deadline set — reply `deadline is [date]` to add one\n"
     reply += f"Priority: {priority}\n"
     reply += f"ID: #{task_id}"
     await update.message.reply_text(reply, parse_mode="Markdown")
@@ -1060,6 +1112,55 @@ async def _do_reschedule(update, event: dict, new_dt: datetime):
         )
     except Exception as exc:
         await update.message.reply_text(f"⚠️ Reschedule failed: {exc}")
+
+
+# ── REMINDER ──────────────────────────────────────────────────────────────────
+
+async def _reminder_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
+    """
+    Create a lightweight reminder — a 15-min calendar event
+    with a popup firing at exactly the reminder time (0 min before).
+    """
+    title      = (parsed.get("title") or "").strip()
+    dt         = parsed.get("datetime")
+    recurrence = parsed.get("recurrence")
+
+    if not title or len(title) < 2:
+        await update.message.reply_text(
+            "What should I remind you about?\n"
+            "E.g. `remind me tomorrow 4pm to check results`"
+        )
+        return
+
+    if not dt:
+        # Ask for time
+        context.user_data["state"]            = "reminder_time"
+        context.user_data["pending_reminder"] = {"title": title, "recurrence": recurrence}
+        await update.message.reply_text(
+            f"⏰ Reminder: *{title}*\n\nWhen? (e.g. `tomorrow 4pm`, `Monday 9am`, `in 2 hours`)",
+            parse_mode="Markdown",
+        )
+        return
+
+    await _do_create_reminder(update, title, dt, recurrence)
+
+
+async def _do_create_reminder(update, title: str, dt: datetime, recurrence=None):
+    try:
+        rrule    = recurrence["rrule"] if recurrence else None
+        event_id = calendar_client.create_reminder(title=title, remind_at=dt, rrule=rrule)
+
+        time_str  = dt.strftime("%a %b %d, %I:%M %p").lstrip("0")
+        recur_str = f"\n🔁 {recurrence['summary'].capitalize()}" if recurrence else ""
+        await update.message.reply_text(
+            f"🔔 *Reminder set!*\n\n"
+            f"*{title}*\n"
+            f"{time_str}"
+            f"{recur_str}",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Couldn't set reminder: {exc}")
 
 
 # ── CALENDAR QUERY ────────────────────────────────────────────────────────────
