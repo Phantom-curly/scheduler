@@ -329,9 +329,10 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         events = calendar_client.get_todays_events()
         if events:
-            lines.append("🗓 *Calendar:*")
+            lines.append("*Calendar:*")
             for e in events:
-                lines.append(f"  • {e.get('summary', 'Event')} — {calendar_client.fmt_event_time(e)}")
+                title = e.get('summary', 'Event')
+                lines.append(f"  • *{title}* — {calendar_client.fmt_event_time_range(e)}")
     except Exception:
         pass
 
@@ -359,9 +360,10 @@ async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         events = calendar_client.list_events_by_day(tomorrow)
         if events:
-            lines.append("🗓 *Calendar:*")
+            lines.append("*Calendar:*")
             for e in events:
-                lines.append(f"  • {e.get('summary', 'Event')} — {calendar_client.fmt_event_time(e)}")
+                title = e.get('summary', 'Event')
+                lines.append(f"  • *{title}* — {calendar_client.fmt_event_time_range(e)}")
     except Exception:
         pass
 
@@ -403,10 +405,10 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {icon}{p_icon} {t['title']}{due_tag}{cal_tag}")
         for e in day_events:
             try:
-                time_str = calendar_client.fmt_event_time(e)
-                lines.append(f"  🗓 {e.get('summary','Event')} — {time_str}")
+                title = e.get('summary', 'Event')
+                lines.append(f"  • *{title}* — {calendar_client.fmt_event_time_range(e)}")
             except Exception:
-                lines.append(f"  🗓 {e.get('summary','Event')}")
+                lines.append(f"  • *{e.get('summary','Event')}*")
 
     if not has_content:
         lines.append("Nothing scheduled this week 🎉")
@@ -1838,7 +1840,8 @@ async def _reschedule_intent(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if len(matches) > 1:
         lines = [f"Found {len(matches)} events matching *{title}*:\n"]
         for i, e in enumerate(matches[:5]):
-            lines.append(f"  {i+1}. {e.get('summary','?')} — {calendar_client.fmt_event_time(e)}")
+            title = e.get('summary', '?')
+            lines.append(f"  {i+1}. *{title}* — {calendar_client.fmt_event_time_range(e)}")
         lines.append("\nReply with the number to reschedule.")
         context.user_data["state"]             = "reschedule_pick"
         context.user_data["reschedule_matches"]= matches[:5]

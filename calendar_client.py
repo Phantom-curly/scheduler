@@ -98,6 +98,31 @@ def fmt_event_time(event: dict) -> str:
     return event.get("start", {}).get("date", "?")
 
 
+def fmt_event_time_range(event: dict) -> str:
+    """Return a string like 'Thu Jun 11, 2:00 PM → 3:30 PM' including end time."""
+    start_dt = parse_event_start(event)
+    if not start_dt:
+        return event.get("start", {}).get("date", "?")
+    start_str = start_dt.strftime("%a %b %d, %I:%M %p").lstrip("0")
+    # Parse end time
+    end = event.get("end", {})
+    end_str = end.get("dateTime") or end.get("date")
+    if not end_str or "T" not in end_str:
+        return start_str  # all-day event, no end time
+    try:
+        import pytz
+        tz = pytz.timezone(os.getenv("TIMEZONE", "Asia/Seoul"))
+        end_dt = datetime.fromisoformat(end_str)
+        if end_dt.tzinfo is None:
+            end_dt = tz.localize(end_dt)
+        else:
+            end_dt = end_dt.astimezone(tz)
+        end_fmt = end_dt.strftime("%I:%M %p").lstrip("0")
+        return f"{start_str} → {end_fmt}"
+    except Exception:
+        return start_str
+
+
 # ── Create ─────────────────────────────────────────────────────────────────────
 
 def create_event(

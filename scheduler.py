@@ -67,9 +67,10 @@ async def morning_briefing(app):
         import calendar_client
         events = calendar_client.get_todays_events()
         if events:
-            lines.append("🗓 *Scheduled today:*")
+            lines.append("*Scheduled today:*")
             for e in events:
-                lines.append(f"  • {e.get('summary','Event')} — {calendar_client.fmt_event_time(e)}")
+                title = e.get('summary', 'Event')
+                lines.append(f"  • *{title}* — {calendar_client.fmt_event_time_range(e)}")
             lines.append("")
     except Exception as exc:
         logger.warning(f"morning calendar fetch: {exc}")
@@ -167,12 +168,13 @@ async def evening_planning_prompt(app):
         import calendar_client as cc
         events = cc.list_events_by_day(tomorrow)
         if events:
-            lines.append("🗓 *Calendar events tomorrow:*")
+            lines.append("*Calendar events tomorrow:*")
             for e in events:
-                lines.append(f"  • {e.get('summary','Event')} — {cc.fmt_event_time(e)}")
+                title = e.get('summary', 'Event')
+                lines.append(f"  • *{title}* — {cc.fmt_event_time_range(e)}")
             lines.append("")
         else:
-            lines.append("🗓 No calendar events tomorrow.\n")
+            lines.append("No calendar events tomorrow.\n")
     except Exception as exc:
         logger.warning(f"evening calendar fetch: {exc}")
         lines.append("🗓 (Couldn't fetch calendar)\n")
