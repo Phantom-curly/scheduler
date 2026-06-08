@@ -6,7 +6,6 @@
   <img src="https://img.shields.io/badge/Python-3.10+-blue?logo=python" alt="Python">
   <img src="https://img.shields.io/badge/Telegram-Bot-26A5E4?logo=telegram" alt="Telegram">
   <img src="https://img.shields.io/badge/Google_Calendar-API-4285F4?logo=google-calendar" alt="Google Calendar">
-  <img src="https://img.shields.io/badge/Railway-Deploy-0B0D0E?logo=railway" alt="Railway">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
 </p>
 
