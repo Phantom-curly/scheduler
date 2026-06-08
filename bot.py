@@ -2054,7 +2054,7 @@ def main():
     db.init_db()
 
     token_b64 = os.getenv("GOOGLE_TOKEN_B64")
-    if token_b64 and not os.path.exists("token.json"):
+    if token_b64:
         with open("token.json", "w") as f:
             f.write(base64.b64decode(token_b64).decode())
         logger.info("Wrote token.json from GOOGLE_TOKEN_B64")

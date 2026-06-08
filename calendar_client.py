@@ -21,12 +21,28 @@ TIMEZONE         = os.getenv("TIMEZONE",                "Asia/Seoul")
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
 def _get_service():
+    import logging
+    logger = logging.getLogger(__name__)
     creds = None
     if os.path.exists(TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+        except Exception as exc:
+            logger.warning(f"Failed to load token.json: {exc}")
+            creds = None
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+                logger.info("Google token refreshed successfully.")
+            except Exception as exc:
+                logger.warning(f"Google token refresh failed: {exc}")
+                logger.warning(
+                    "The token has expired or been revoked. "
+                    "Run `python auth_calendar.py` locally to generate a new one, "
+                    "then update GOOGLE_TOKEN_B64 in your environment."
+                )
+                raise
         else:
             if not os.path.exists(CREDENTIALS_PATH):
                 raise FileNotFoundError(
