@@ -603,13 +603,13 @@ def extract_datetime(text: str) -> Optional[datetime]:
     return dateparser.parse(text, settings={"PREFER_DATES_FROM": "future", "PREFER_DAY_OF_MONTH": "first"})
 
 
-def extract_duration(text: str) -> int:
+def extract_duration(text: str) -> Optional[int]:
     m = _BOTH_DURATION_RE.search(text) or _DURATION_RE.search(text) or _EFFORT_RE.search(text) or _BARE_DURATION_RE.search(text)
     if m:
         amount = float(m.group(1))
         unit   = m.group(2).lower()
         return int(amount * 60) if ("hour" in unit or "hr" in unit) else int(amount)
-    return 60
+    return None
 
 
 def extract_reminder_minutes(text: str) -> int:

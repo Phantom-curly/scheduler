@@ -532,6 +532,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == "scheduling":
         await _scheduling_time(update, context, text)
         return
+    if state == "scheduling_end_time":
+        await _scheduling_end_time(update, context, text)
+        return
     if state == "schedule_direct":
         await _schedule_direct_time(update, context, text)
         return
@@ -880,7 +883,7 @@ async def _scheduling_time(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         context.user_data["schedule_suggested"] = None
         await update.message.reply_text(
             f"When would you like to schedule _{task['title']}_?\n"
-            "(e.g. `Thursday 2pm for 2 hours`)",
+            "(e.g. `Thursday 2pm to 4pm`)",
             parse_mode="Markdown",
         )
         return
@@ -903,10 +906,21 @@ async def _scheduling_time(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         return
 
     duration  = nlp.extract_duration(text)
-    if duration == 60 and task["estimated_minutes"]:
-        duration = int(task["estimated_minutes"])
     reminder  = nlp.compute_reminder_minutes(text, dt)
-    end_dt    = dt + timedelta(minutes=duration)
+
+    # If no duration given, enter end-time state
+    if not duration:
+        context.user_data["scheduling_start_dt"] = dt
+        context.user_data["scheduling_reminder"] = reminder
+        context.user_data["state"] = "scheduling_end_time"
+        await update.message.reply_text(
+            f"⏰ _{task['title']}_ at {_fmt_dt(dt)}\n\n"
+            "When does it finish? (e.g. `2pm`, `4:30 PM`, `in 2 hours`)",
+            parse_mode="Markdown",
+        )
+        return
+
+    end_dt = dt + timedelta(minutes=duration)
 
     # Confirmation step — ask before creating event
     reply_lines = [
@@ -934,6 +948,68 @@ async def _scheduling_time(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     }
     context.user_data["state"] = "confirm_schedule"
 
+    await update.message.reply_text("\n".join(reply_lines), parse_mode="Markdown")
+
+
+async def _scheduling_end_time(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """User already gave a start time, now we need the end time."""
+    task_ids = context.user_data["pending_schedule"]
+    task_id  = task_ids[context.user_data["schedule_idx"]]
+    task     = db.get_task(task_id)
+    dt       = context.user_data["scheduling_start_dt"]
+    reminder = context.user_data.get("scheduling_reminder", 30)
+
+    end_dt = nlp.extract_datetime(text, base_time=dt)
+    if not end_dt:
+        # Try parsing as a time-of-day (e.g. "2pm", "4:30 PM")
+        import pytz
+        tz = pytz.timezone(os.getenv("TIMEZONE", "Asia/Seoul"))
+        try:
+            parsed_time = datetime.strptime(text.strip(), "%I:%M %p")
+            parsed_time = datetime.strptime(text.strip().lstrip("0"), "%I:%M %p")
+        except ValueError:
+            try:
+                parsed_time = datetime.strptime(text.strip(), "%I %p")
+            except ValueError:
+                parsed_time = None
+        if parsed_time:
+            end_dt = dt.replace(hour=parsed_time.hour, minute=parsed_time.minute, second=0, microsecond=0)
+            if end_dt <= dt:
+                end_dt += timedelta(days=1)  # next day if end is before start
+        else:
+            # Try "in X hours/minutes"
+            dur = nlp.extract_duration(text)
+            if dur:
+                end_dt = dt + timedelta(minutes=dur)
+
+    if not end_dt or end_dt <= dt:
+        await update.message.reply_text(
+            "Couldn't parse that. Try a time like `2pm`, `4:30 PM`, `in 2 hours`, or /cancel.",
+        )
+        return
+
+    duration = int((end_dt - dt).total_seconds() / 60)
+    context.user_data.pop("scheduling_start_dt", None)
+    context.user_data.pop("scheduling_reminder", None)
+
+    reply_lines = [
+        f"📅 *Confirm schedule:*\n",
+        f"*{task['title']}*\n"
+        f"📍 {_fmt_dt(dt)} → {end_dt.strftime('%I:%M %p')} ({duration} min)\n"
+        f"⏰ Reminder: {reminder} min before",
+    ]
+    reply_lines.append("\nReply `yes` to confirm, `no` to skip.")
+
+    context.user_data["confirm_schedule"] = {
+        "type": "task",
+        "task_id": task_id,
+        "task_title": task["title"],
+        "dt": dt,
+        "duration": duration,
+        "reminder": reminder,
+        "end_dt": end_dt,
+    }
+    context.user_data["state"] = "confirm_schedule"
     await update.message.reply_text("\n".join(reply_lines), parse_mode="Markdown")
 
 
