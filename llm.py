@@ -30,8 +30,8 @@ Today: {today}. User timezone: Asia/Seoul.
 Output ONLY valid compact JSON — no prose, no markdown, no backticks.
 
 INTENTS:
-add_task | list_tasks | schedule_tasks | schedule_direct | complete | delete | update
-habit_add | habit_list | habit_delete | calendar_query | help | clarify | unknown
+add_task | list_tasks | schedule_tasks | schedule_direct | complete | delete | update | reschedule
+reminder | free_time | plan_tasks | habit_add | habit_list | habit_delete | calendar_query | help | clarify | unknown
 
 SCHEMA (omit null fields):
 {
@@ -43,6 +43,9 @@ SCHEMA (omit null fields):
   "priority": "high"|"medium"|"low",  // infer from urgency words
   "slots": ["YYYY-MM-DDTHH:MM"],      // ALL time slots for scheduling
   "duration_minutes": int,
+  "category": "focus"|"fitness"|"meeting"|"errand"|"home"|"general",
+  "energy": "high"|"medium"|"low",
+  "splittable": boolean,
   "reminder_minutes": int,
   "rrule": string,              // RRULE:FREQ=... if recurring
   "recurrence_summary": string,
@@ -60,17 +63,45 @@ PRIORITY RULES:
 - "sometime","eventually","when I can","low priority" → low
 - default → medium
 
+TIME-OF-DAY MAPPINGS (resolve ambiguous times to the closest future occurrence):
+  "dawn"      → 5:00 AM
+  "morning"   → 8:00 AM
+  "lunch"     → 12:00 PM
+  "noon"      → 12:00 PM
+  "afternoon" → 2:00 PM
+  "dusk"      → 5:00 PM
+  "evening"   → 8:00 PM
+  "night"     → 9:00 PM
+  "midnight"  → 12:00 AM
+If the time-of-day has already passed today, push it to tomorrow.
+Example: now=10 AM, "evening" → 8 PM today. now=2 PM, "morning" → 8 AM tomorrow.
+
+DEFAULT TIME RULES:
+- Bare day names ("monday", "friday") default to 9:00 AM that day
+- "tomorrow" with no time → 9:00 AM tomorrow
+- "today" with no time → current time
+- "in 3 days" / "in 2 weeks" → relative from today at 9:00 AM
+- "day after tomorrow" → 2 days from now at 9:00 AM
+- "17th of next month" → that date at 9:00 AM
+
 MULTI-TASK RULES:
 - "I have a midterm Thursday and assignment due Friday" → titles=["Midterm","Assignment"] deadlines=[...]
 - "block 3h study Tuesday and Wednesday evening" → intent=schedule_direct slots=[both datetimes]
+- "schedule gym on monday at 9 pm and friday 7 pm" → intent=schedule_direct slots=["2025-01-13T21:00","2025-01-17T19:00"] duration_minutes=120
 
 REMINDER: "remind me to X at Y", "remind me tomorrow 4pm to X", "set reminder for X" → intent=reminder, title=X (what to be reminded of), slots=[reminder datetime]
+"remind me at lunch to do X" → intent=reminder, title="X", slots=[today 12:00 PM]
+"remind me in the evening to check results" → intent=reminder, title="Check results", slots=[today 8:00 PM]
 RESCHEDULE: "reschedule X to Y", "move X to Y", "push X to Y" → intent=reschedule, title=event name, slots=[new datetime]
+FREE TIME: "when am I free tomorrow", "find me 2 hours this week" → intent=free_time, duration_minutes=needed block size
+PLAN TASKS: "plan my tasks", "fit my todos this week" → intent=plan_tasks
 
 CLARIFY ONLY when genuinely ambiguous (not just missing a time — that's normal).
 Example: "do the thing" → clarify="What task did you mean?"
 
 NEVER clarify just because a time is missing — smart scheduling will handle that.
+
+IMPORTANT: When extracting slots, always resolve time-of-day words and apply default 9:00 AM for bare days.
 """
 
 
@@ -134,6 +165,9 @@ def normalise(llm: Dict[str, Any]) -> Dict[str, Any]:
         "deadlines":    llm.get("deadlines"),    # parallel to titles
         "priority":     llm.get("priority", "medium"),
         "duration":     llm.get("duration_minutes") or 60,
+        "category":     llm.get("category") or "general",
+        "energy":       llm.get("energy") or "medium",
+        "splittable":   bool(llm.get("splittable", False)),
         "reminder":     llm.get("reminder_minutes") or 30,
         "recurrence":   None,
         "multi_slots":  None,
@@ -199,6 +233,8 @@ def _map_intent(i: str) -> str:
         "update":          "update",
         "reschedule":      "reschedule",
         "reminder":        "reminder",
+        "free_time":       "free_time",
+        "plan_tasks":      "plan",
         "habit_add":       "habit_add",
         "habit_list":      "habit_list",
         "habit_delete":    "habit_delete",

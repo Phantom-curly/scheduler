@@ -141,6 +141,180 @@ def format_slots_for_display(slots: List[Dict], limit: int = 5) -> str:
     return "\n".join(lines)
 
 
+def _task_minutes(task: Dict, fallback: int = 60) -> int:
+    try:
+        return int(task.get("estimated_minutes") or fallback)
+    except Exception:
+        return fallback
+
+
+def _deadline_pressure(task: Dict, slot_start: datetime) -> int:
+    deadline = task.get("deadline")
+    if not deadline:
+        return 0
+    try:
+        days_left = (datetime.fromisoformat(deadline).date() - slot_start.date()).days
+    except Exception:
+        return 0
+    if days_left < 0:
+        return 90
+    if days_left == 0:
+        return 70
+    if days_left == 1:
+        return 45
+    if days_left <= 3:
+        return 25
+    return 5
+
+
+def _slot_fit_score(task: Dict, slot: Dict) -> int:
+    minutes = _task_minutes(task)
+    if slot["duration_minutes"] < minutes:
+        return -10_000
+
+    start    = slot["start"]
+    category = (task.get("category") or "general").lower()
+    energy   = (task.get("energy") or "medium").lower()
+    priority = (task.get("priority") or "medium").lower()
+
+    score = 100
+    score += _deadline_pressure(task, start)
+    score += {"high": 25, "medium": 10, "low": 0}.get(priority, 10)
+
+    leftover = slot["duration_minutes"] - minutes
+    score -= min(leftover // 30, 8)
+
+    hour = start.hour
+    if category == "focus":
+        if 8 <= hour <= 13:
+            score += 25
+        elif hour >= 20:
+            score -= 20
+    elif category == "fitness":
+        if 7 <= hour <= 10 or 18 <= hour <= 21:
+            score += 25
+        elif 11 <= hour <= 16:
+            score -= 10
+    elif category == "meeting":
+        if 9 <= hour <= 17:
+            score += 20
+    elif category in ("errand", "home"):
+        if 10 <= hour <= 18:
+            score += 10
+
+    if energy == "high" and hour >= 20:
+        score -= 15
+    if energy == "low" and 8 <= hour <= 11:
+        score -= 5
+
+    earliest = task.get("earliest_start")
+    if earliest:
+        try:
+            if start < datetime.fromisoformat(earliest):
+                return -10_000
+        except Exception:
+            pass
+
+    return score
+
+
+def best_slots_for_task(task: Dict, free_slots: List[Dict], limit: int = 3) -> List[Dict]:
+    ranked = []
+    for slot in free_slots:
+        score = _slot_fit_score(task, slot)
+        if score > -10_000:
+            ranked.append({**slot, "score": score})
+    ranked.sort(key=lambda s: s["score"], reverse=True)
+    return ranked[:limit]
+
+
+def build_task_plan(tasks: List[Dict], free_slots: List[Dict], limit: int = 6) -> List[Dict]:
+    """Greedy planner that assigns unscheduled tasks to appropriate free blocks.
+    Supports splittable tasks: if a task won't fit in one slot, it will be split
+    across multiple consecutive slots."""
+    planned = []
+    used = set()
+
+    def task_sort_key(t):
+        priority = {"high": 0, "medium": 1, "low": 2}.get((t.get("priority") or "medium").lower(), 1)
+        deadline = t.get("deadline") or "9999-12-31"
+        return (deadline, priority, _task_minutes(t))
+
+    for task in sorted(tasks, key=task_sort_key):
+        task_minutes = _task_minutes(task)
+        splittable = task.get("splittable", False) or (task_minutes >= 120)
+        remaining = task_minutes
+        chunks = []
+
+        # Try to find a single slot first
+        candidates = best_slots_for_task(task, [s for i, s in enumerate(free_slots) if i not in used], limit=1)
+        if candidates:
+            slot = candidates[0]
+            if slot["duration_minutes"] >= remaining:
+                original_idx = free_slots.index(next(s for s in free_slots if s["start"] == slot["start"] and s["end"] == slot["end"]))
+                used.add(original_idx)
+                planned.append({
+                    "task": task,
+                    "start": slot["start"],
+                    "end": slot["start"] + timedelta(minutes=remaining),
+                    "slot_end": slot["end"],
+                    "score": slot["score"],
+                    "chunk": None,
+                })
+                if len(planned) >= limit:
+                    break
+                continue
+
+        # Task doesn't fit in one slot — try splitting if allowed
+        if splittable:
+            available_slots = [s for i, s in enumerate(free_slots) if i not in used]
+            available_slots.sort(key=lambda s: s["start"])
+            for slot in available_slots:
+                if remaining <= 0:
+                    break
+                chunk_duration = min(remaining, slot["duration_minutes"])
+                if chunk_duration < 30:
+                    continue  # skip slots too small even for a chunk
+                original_idx = free_slots.index(next(s for s in free_slots if s["start"] == slot["start"] and s["end"] == slot["end"]))
+                used.add(original_idx)
+                chunks.append({
+                    "task": task,
+                    "start": slot["start"],
+                    "end": slot["start"] + timedelta(minutes=chunk_duration),
+                    "score": 50,
+                    "chunk": len(chunks) + 1,
+                })
+                remaining -= chunk_duration
+                if len(planned) + len(chunks) >= limit:
+                    break
+
+            if chunks and remaining <= 0:
+                # Only add chunks if we fit the whole task
+                for ch in chunks:
+                    ch["total_chunks"] = len(chunks)
+                    planned.append(ch)
+                if len(planned) >= limit:
+                    break
+
+    return planned
+
+
+def format_task_plan(plan: List[Dict]) -> str:
+    lines = []
+    for i, item in enumerate(plan, start=1):
+        task = item["task"]
+        day  = item["start"].strftime("%a %b %d")
+        t_s  = item["start"].strftime("%I:%M %p").lstrip("0")
+        t_e  = item["end"].strftime("%I:%M %p").lstrip("0")
+        chunk = item.get("chunk")
+        total = item.get("total_chunks")
+        chunk_tag = f" (part {chunk}/{total})" if chunk and total else ""
+        due  = f", due {task['deadline']}" if task.get("deadline") else ""
+        dur = int((item["end"] - item["start"]).total_seconds() / 60)
+        lines.append(f"{i}. {day}, {t_s} - {t_e}: {task['title']}{chunk_tag} ({dur} min{due})")
+    return "\n".join(lines)
+
+
 # ── AI slot picker ────────────────────────────────────────────────────────────
 
 def suggest_slot(title: str, duration_minutes: int, free_slots: List[Dict]) -> Optional[Dict]:

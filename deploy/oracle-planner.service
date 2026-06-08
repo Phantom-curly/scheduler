@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Planner Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/planner_bot
+EnvironmentFile=/opt/planner_bot/.env
+ExecStart=/opt/planner_bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

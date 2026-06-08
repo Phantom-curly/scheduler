@@ -235,6 +235,36 @@ def list_upcoming_events(days: int = 7) -> List[dict]:
     return result.get("items", [])
 
 
+def list_events_by_day(day: datetime.date) -> List[dict]:
+    """Return all calendar events for a specific day."""
+    import pytz
+    service  = _get_service()
+    tz       = pytz.timezone(TIMEZONE)
+    day_start = tz.localize(datetime(day.year, day.month, day.day, 0, 0, 0))
+    day_end   = tz.localize(datetime(day.year, day.month, day.day, 23, 59, 59))
+
+    result = service.events().list(
+        calendarId  = CALENDAR_ID,
+        timeMin     = day_start.astimezone(pytz.utc).isoformat().replace("+00:00", "Z"),
+        timeMax     = day_end.astimezone(pytz.utc).isoformat().replace("+00:00", "Z"),
+        singleEvents= True,
+        orderBy     = "startTime",
+    ).execute()
+    return result.get("items", [])
+
+
+def get_event(event_id: str) -> Optional[dict]:
+    """Fetch a single event by its ID. Returns None if not found."""
+    try:
+        service = _get_service()
+        return service.events().get(
+            calendarId=CALENDAR_ID,
+            eventId=event_id,
+        ).execute()
+    except Exception:
+        return None
+
+
 def get_todays_events() -> List[dict]:
     service                    = _get_service()
     day_start_iso, day_end_iso = _local_day_bounds_utc()
