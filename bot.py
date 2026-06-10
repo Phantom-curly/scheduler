@@ -19,6 +19,7 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta
+from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
