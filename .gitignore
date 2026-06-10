@@ -1,7 +1,12 @@
 # Secrets - never commit these
 .env
+.env.*
 token.json
 credentials.json
+*.pem
+*.key
+*.crt
+*.cer
 
 # Database
 planner.db
@@ -30,11 +35,15 @@ ENV/
 .idea/
 *.swp
 *.swo
+*.code-workspace
 .DS_Store
 
 # Logs
 *.log
 logs/
+
+# Virtual environments
+planner/
 
 # Railway
 .railway/

@@ -15,7 +15,6 @@ State machine in context.user_data['state']:
 """
 
 import asyncio
-import base64
 import logging
 import os
 import re
@@ -2131,12 +2130,6 @@ def main():
         raise ValueError("TELEGRAM_TOKEN is not set.")
 
     db.init_db()
-
-    token_b64 = os.getenv("GOOGLE_TOKEN_B64")
-    if token_b64:
-        with open("token.json", "w") as f:
-            f.write(base64.b64decode(token_b64).decode())
-        logger.info("Wrote token.json from GOOGLE_TOKEN_B64")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

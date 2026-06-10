@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
+from google.auth import exceptions as google_auth_exceptions
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -20,29 +21,84 @@ TIMEZONE         = os.getenv("TIMEZONE",                "Asia/Seoul")
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
+# ---------------------------------------------------------------------------
+# Google may revoke a refresh token when:
+#   1. The token hasn't been used for 6 months.
+#   2. The user revokes access via their Google Account.
+#   3. The OAuth consent screen settings are changed in Google Cloud Console.
+#   4. The app is in "testing" mode and the token exceeds its 7-day lifetime.
+#
+# Recovery: run `python auth_calendar.py` locally, then copy the resulting
+# token.json to the deployed environment.
+# ---------------------------------------------------------------------------
+
+class TokenRefreshError(RuntimeError):
+    """Raised when the Google OAuth refresh token is invalid, revoked, or
+    the refresh request fails for any reason.  The original exception is
+    attached as ``__cause__`` so the full traceback is preserved in logs."""
+
+
 def _get_service():
     import logging
     logger = logging.getLogger(__name__)
+
     creds = None
     if os.path.exists(TOKEN_PATH):
         try:
             creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
         except Exception as exc:
-            logger.warning(f"Failed to load token.json: {exc}")
+            logger.warning("Failed to load token.json: %s", exc, exc_info=True)
             creds = None
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
+            # ── attempt silent refresh ──────────────────────────────────
             try:
                 creds.refresh(Request())
                 logger.info("Google token refreshed successfully.")
-            except Exception as exc:
-                logger.warning(f"Google token refresh failed: {exc}")
-                logger.warning(
-                    "The token has expired or been revoked. "
-                    "Run `python auth_calendar.py` locally to generate a new one, "
-                    "then update GOOGLE_TOKEN_B64 in your environment."
+            except google_auth_exceptions.RefreshError as exc:
+                # RefreshError covers invalid_grant, revoked token,
+                # expired token, and misconfigured client secrets.
+                logger.error(
+                    "Google OAuth refresh token is invalid or revoked. "
+                    "Run `python auth_calendar.py` locally to generate a "
+                    "new token.json, then deploy it to the server environment. "
+                    "Underlying error: %s",
+                    exc,
+                    exc_info=True,
                 )
-                raise
+                raise TokenRefreshError(
+                    "Google OAuth refresh token is invalid or revoked. "
+                    "Run auth_calendar.py to generate a new token.json and redeploy it."
+                ) from exc
+            except google_auth_exceptions.TransportError as exc:
+                logger.error(
+                    "Network error during Google OAuth token refresh. "
+                    "Check server connectivity. Underlying error: %s",
+                    exc,
+                    exc_info=True,
+                )
+                raise TokenRefreshError(
+                    "Network error during Google OAuth token refresh."
+                ) from exc
+            except google_auth_exceptions.GoogleAuthError as exc:
+                logger.error(
+                    "Google OAuth refresh failed with an unexpected error: %s",
+                    exc,
+                    exc_info=True,
+                )
+                raise TokenRefreshError(
+                    "Unexpected Google OAuth error during token refresh."
+                ) from exc
+            except Exception as exc:
+                logger.error(
+                    "Unexpected error during Google OAuth token refresh: %s",
+                    exc,
+                    exc_info=True,
+                )
+                raise TokenRefreshError(
+                    "Unexpected error during Google OAuth token refresh."
+                ) from exc
         else:
             if not os.path.exists(CREDENTIALS_PATH):
                 raise FileNotFoundError(
@@ -50,8 +106,11 @@ def _get_service():
                 )
             flow  = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
             creds = flow.run_local_server(port=0)
+
+        # Persist the (possibly refreshed or newly authorised) token.
         with open(TOKEN_PATH, "w") as f:
             f.write(creds.to_json())
+
     return build("calendar", "v3", credentials=creds)
 
 
