@@ -30,8 +30,10 @@ _INTENTS = {
         r"\bhabit\s*:\s*.+",
     ],
     "schedule_direct": [
-        r"\bschedule\b.{1,80}\b(on|at|this|next|every)\b",
+        r"\bschedule\b.{1,80}\b(on|at|this|next|every|today|tomorrow|from)\b",
         r"\bschedule\b.{1,40}\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b",
+        r"\bschedule\b.{1,60}\d{1,2}\s*(?:am|pm)\b",
+        r"\bschedule\b.{1,80}\bfrom\b",
         r"\b(block|put|add)\b.{1,40}\b(on|at|in|to)\b.{1,30}\b(calendar|cal)\b",
     ],
     "batch_schedule": [
@@ -145,6 +147,12 @@ _BARE_DURATION_RE = re.compile(
 )
 _BOTH_DURATION_RE = re.compile(
     r"\bboth\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?)\b",
+    re.IGNORECASE,
+)
+
+# "from X to Y" duration — e.g. "from 9 pm to 11 pm", "from 9:30 to 11"
+_FROM_TO_DURATION_RE = re.compile(
+    r"\bfrom\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:to|–|-)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b",
     re.IGNORECASE,
 )
 
@@ -604,6 +612,28 @@ def extract_datetime(text: str) -> Optional[datetime]:
 
 
 def extract_duration(text: str) -> Optional[int]:
+    # First: try "from X to Y" — compute the difference between start and end times
+    m = _FROM_TO_DURATION_RE.search(text)
+    if m:
+        try:
+            start_str = m.group(1).strip()
+            end_str   = m.group(2).strip()
+            # Parse both times, assume today
+            start_dt = dateparser.parse(start_str, settings={"PREFER_DATES_FROM": "future"})
+            end_dt   = dateparser.parse(end_str,   settings={"PREFER_DATES_FROM": "future"})
+            if start_dt and end_dt:
+                now = datetime.now()
+                start = now.replace(hour=start_dt.hour, minute=start_dt.minute, second=0, microsecond=0)
+                end   = now.replace(hour=end_dt.hour, minute=end_dt.minute, second=0, microsecond=0)
+                # If end is before start, assume it crosses midnight (e.g. 9pm to 11pm won't, but 10pm to 2am would)
+                if end <= start:
+                    end += timedelta(days=1)
+                diff = int((end - start).total_seconds() / 60)
+                if diff > 0:
+                    return diff
+        except Exception:
+            pass
+
     m = _BOTH_DURATION_RE.search(text) or _DURATION_RE.search(text) or _EFFORT_RE.search(text) or _BARE_DURATION_RE.search(text)
     if m:
         amount = float(m.group(1))

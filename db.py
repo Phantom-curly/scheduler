@@ -453,6 +453,14 @@ def get_reminder(reminder_id):
         return conn.execute("SELECT * FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
 
 
+def delete_reminder(reminder_id):
+    with get_conn() as conn:
+        reminder = conn.execute("SELECT * FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
+        conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+        conn.commit()
+        return reminder
+
+
 def update_reminder(reminder_id, **kwargs):
     if not kwargs:
         return

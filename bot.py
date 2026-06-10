@@ -142,7 +142,15 @@ def _fmt_entity(entity_type: str, entity) -> str:
 
 
 async def _handle_reply_edit(update, context) -> bool:
-    """Try to interpret a reply as an edit to the referenced entity.
+    """Try to interpret a reply as an edit/delete to the referenced entity.
+    Supports:
+      - Reply with "delete" → enters confirmation flow
+      - Reply with "update" → enters update flow
+      - Reply with a datetime → updates time
+      - Reply with "title: New Title" → updates title
+      - Reply with "time: <datetime>" → updates time
+      - Reply with plain text (no keywords) → updates title
+
     Returns True if the reply was handled as an edit, False to fall through."""
     replied = update.message.reply_to_message
     text = update.message.text.strip()
@@ -153,9 +161,51 @@ async def _handle_reply_edit(update, context) -> bool:
         return False
 
     entity_type, entity_id = ref
+    text_lower = text.lower()
 
-    # Try to parse as a time update
+    # ─── "delete" keyword → confirmation flow ──────────────────────────────────
+    if text_lower in ("delete", "remove", "del", "rm", "🗑"):
+        context.user_data["reply_delete"] = {
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+        }
+        context.user_data["state"] = "replying_delete"
+
+        type_emoji = {"task": "📝", "reminder": "🔔", "cal_event": "📅"}
+        emoji = type_emoji.get(entity_type, "❓")
+        title = _get_entity_title(entity_type, entity_id) or "this item"
+        await update.message.reply_text(
+            f"{emoji} Delete *{title}*?\n\nReply `yes` to confirm, `no` to cancel.",
+            parse_mode="Markdown",
+        )
+        return True
+
+    # ─── "update" keyword → enter interactive update flow ──────────────────────
+    if text_lower in ("update", "edit", "change", "modify", "✏️"):
+        context.user_data["reply_update"] = {
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+        }
+        context.user_data["state"] = "replying_update"
+        title = _get_entity_title(entity_type, entity_id) or "this item"
+
+        await update.message.reply_text(
+            f"✏️ Updating *{title}*\n\n"
+            "What to change? Reply with:\n"
+            "• `time: tomorrow 4pm` — new time\n"
+            "• `title: New Name` — new title\n"
+            "• A plain time like `tomorrow 6pm` — new time\n"
+            "• A plain title — new title",
+            parse_mode="Markdown",
+        )
+        return True
+
+    # ─── Try to parse as a time update ─────────────────────────────────────────
     new_dt = nlp.extract_datetime(text)
+
+    # Check for explicit "title:" or "time:" prefixes
+    title_prefix = re.match(r"^title:\s*(.+)$", text, re.IGNORECASE)
+    time_prefix  = re.match(r"^time:\s*(.+)$", text, re.IGNORECASE)
 
     if entity_type == "reminder":
         reminder = db.get_reminder(int(entity_id))
@@ -163,9 +213,14 @@ async def _handle_reply_edit(update, context) -> bool:
             await update.message.reply_text("⚠️ That reminder no longer exists.")
             return True
 
-        if new_dt:
-            db.update_reminder(reminder["id"], remind_at=new_dt.isoformat())
-            reminder = db.get_reminder(reminder["id"])  # re-fetch
+        # "time: <datetime>"
+        if time_prefix:
+            dt = nlp.extract_datetime(time_prefix.group(1))
+            if not dt:
+                await update.message.reply_text("Couldn't parse that time. Try `time: tomorrow 4pm`.")
+                return True
+            db.update_reminder(reminder["id"], remind_at=dt.isoformat())
+            reminder = db.get_reminder(reminder["id"])
             await update.message.reply_text(
                 f"✅ *Reminder Updated*\n\n{_fmt_entity('reminder', reminder)}"
                 f"{_entity_ref_line('reminder', reminder['id'])}",
@@ -173,8 +228,34 @@ async def _handle_reply_edit(update, context) -> bool:
             )
             return True
 
-        # Maybe user gave a new title
-        if len(text) > 2 and text.lower() not in ("yes", "no", "ok", "cancel", "done"):
+        # "title: New Title"
+        if title_prefix:
+            new_title = title_prefix.group(1).strip().capitalize()
+            if len(new_title) < 2:
+                await update.message.reply_text("Title too short.")
+                return True
+            db.update_reminder(reminder["id"], title=new_title)
+            reminder = db.get_reminder(reminder["id"])
+            await update.message.reply_text(
+                f"✅ *Reminder Updated*\n\n{_fmt_entity('reminder', reminder)}"
+                f"{_entity_ref_line('reminder', reminder['id'])}",
+                parse_mode="Markdown",
+            )
+            return True
+
+        # New datetime → update time
+        if new_dt:
+            db.update_reminder(reminder["id"], remind_at=new_dt.isoformat())
+            reminder = db.get_reminder(reminder["id"])
+            await update.message.reply_text(
+                f"✅ *Reminder Updated*\n\n{_fmt_entity('reminder', reminder)}"
+                f"{_entity_ref_line('reminder', reminder['id'])}",
+                parse_mode="Markdown",
+            )
+            return True
+
+        # Plain text → new title (if long enough)
+        if len(text) > 2 and text_lower not in ("yes", "no", "ok", "cancel", "done", "y", "n"):
             db.update_reminder(reminder["id"], title=text)
             reminder = db.get_reminder(reminder["id"])
             await update.message.reply_text(
@@ -193,15 +274,38 @@ async def _handle_reply_edit(update, context) -> bool:
             return True
 
         updates = {}
-        if new_dt:
+
+        # "time: <datetime>" → new deadline
+        if time_prefix:
+            dt = nlp.extract_datetime(time_prefix.group(1))
+            if dt:
+                updates["deadline"] = dt.date().isoformat()
+            else:
+                await update.message.reply_text("Couldn't parse that time. Try `time: next Friday`.")
+                return True
+
+        # "title: New Title"
+        if title_prefix:
+            new_title = title_prefix.group(1).strip().capitalize()
+            if len(new_title) >= 2:
+                updates["title"] = new_title
+
+        # Plain datetime → new deadline
+        if not title_prefix and not time_prefix and new_dt:
             updates["deadline"] = new_dt.date().isoformat()
 
-        # Check for title: just text without time, longer than 2 chars
-        if not updates and len(text) > 2 and text.lower() not in ("yes", "no", "ok", "cancel", "done"):
+        # Plain text (no datetime, no prefix) → new title
+        if not updates and len(text) > 2 and text_lower not in ("yes", "no", "ok", "cancel", "done", "y", "n"):
             updates["title"] = text
 
         if updates:
             db.update_task(task["id"], **updates)
+            # If title changed and event exists, update calendar too
+            if "title" in updates and task["calendar_event_id"]:
+                try:
+                    calendar_client.update_event(task["calendar_event_id"], title=updates["title"])
+                except Exception:
+                    pass
             task = db.get_task(task["id"])
             await update.message.reply_text(
                 f"✏️ *Task Updated*\n\n{_fmt_entity('task', task)}"
@@ -213,12 +317,33 @@ async def _handle_reply_edit(update, context) -> bool:
         return False
 
     elif entity_type == "cal_event":
+        # "time: <datetime>"
+        if time_prefix:
+            dt = nlp.extract_datetime(time_prefix.group(1))
+            if not dt:
+                await update.message.reply_text("Couldn't parse that time. Try `time: tomorrow 6pm`.")
+                return True
+            try:
+                dur = calendar_client.reschedule_event(entity_id, dt)
+                end = dt + timedelta(minutes=dur)
+                db.update_task_schedule_by_event(entity_id, dt.isoformat(), end.isoformat())
+                await update.message.reply_text(
+                    f"✅ *Calendar Event Updated*\n\n"
+                    f"New time: {_fmt_dt(dt)} → {end.strftime('%I:%M %p')}"
+                    f"{_entity_ref_line('cal_event', entity_id)}",
+                    parse_mode="Markdown",
+                )
+                return True
+            except Exception as exc:
+                await update.message.reply_text(f"⚠️ Couldn't update calendar event: {exc}")
+                return True
+
         if not new_dt:
             return False
         try:
-            from calendar_client import reschedule_event as _reschedule
-            dur = _reschedule(entity_id, new_dt)
+            dur = calendar_client.reschedule_event(entity_id, new_dt)
             end = new_dt + timedelta(minutes=dur)
+            db.update_task_schedule_by_event(entity_id, new_dt.isoformat(), end.isoformat())
             await update.message.reply_text(
                 f"✅ *Calendar Event Updated*\n\n"
                 f"New time: {_fmt_dt(new_dt)} → {end.strftime('%I:%M %p')}"
@@ -231,6 +356,22 @@ async def _handle_reply_edit(update, context) -> bool:
             return True
 
     return False
+
+
+def _get_entity_title(entity_type: str, entity_id) -> Optional[str]:
+    """Get a human-readable title for an entity by its type and id."""
+    try:
+        if entity_type == "task":
+            t = db.get_task(int(entity_id))
+            return t["title"] if t else None
+        elif entity_type == "reminder":
+            r = db.get_reminder(int(entity_id))
+            return r["title"] if r else None
+        elif entity_type == "cal_event":
+            return "calendar event"  # generic; can't search by id
+    except Exception:
+        return None
+    return None
 
 
 # ── Commands ───────────────────────────────────────────────────────────────────
@@ -543,6 +684,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == "updating":
         await _update_value(update, context, text)
         return
+    if state == "replying_delete":
+        await _reply_delete_confirm(update, context, text)
+        return
+
+    if state == "replying_update":
+        await _reply_update_value(update, context, text)
+        return
+
     if state == "reminder_time":
         pending  = context.user_data.pop("pending_reminder", {})
         title    = pending.get("title", "Reminder")
@@ -637,10 +786,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Still not sure — try rephrasing or /help for examples.")
         return
 
-    # Try LLM first, fall back to regex if unavailable
+    # Try LLM first, but fall back to regex if LLM is unsure or unavailable
     llm_result = llm_client.parse(text)
     if llm_result:
         parsed = llm_client.normalise(llm_result)
+        # If LLM returned unknown/clarify, the regex parser does better
+        if parsed["intent"] in ("unknown", "clarify"):
+            parsed = nlp.parse_message(text)
     else:
         parsed = nlp.parse_message(text)
     intent = parsed["intent"]
@@ -958,7 +1110,7 @@ async def _scheduling_end_time(update: Update, context: ContextTypes.DEFAULT_TYP
     dt       = context.user_data["scheduling_start_dt"]
     reminder = context.user_data.get("scheduling_reminder", 30)
 
-    end_dt = nlp.extract_datetime(text, base_time=dt)
+    end_dt = nlp.extract_datetime(text)
     if not end_dt:
         # Try parsing as a time-of-day (e.g. "2pm", "4:30 PM")
         import pytz
@@ -1735,6 +1887,190 @@ async def _delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, te
 
     context.user_data["state"] = "idle"
     context.user_data.pop("pending_delete_id", None)
+
+
+# ── REPLY-BASED DELETE CONFIRM ───────────────────────────────────────────────
+
+async def _reply_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Handle confirmation of a reply-based delete request."""
+    data = context.user_data.get("reply_delete")
+    if not data:
+        context.user_data["state"] = "idle"
+        await update.message.reply_text("⚠️ Nothing to delete right now.")
+        return
+
+    text_lower = text.strip().lower()
+    if text_lower not in ("yes", "y", "yep", "sure", "confirm", "delete"):
+        context.user_data["state"] = "idle"
+        context.user_data.pop("reply_delete", None)
+        await update.message.reply_text("❌ Deletion cancelled.")
+        return
+
+    entity_type = data["entity_type"]
+    entity_id = data["entity_id"]
+
+    try:
+        if entity_type == "task":
+            task = db.delete_task(int(entity_id))
+            if task and task["calendar_event_id"]:
+                try:
+                    calendar_client.delete_event(task["calendar_event_id"])
+                except Exception:
+                    pass
+            title = task["title"] if task else "Task"
+            await update.message.reply_text(f"🗑 Deleted task: *{title}*", parse_mode="Markdown")
+
+        elif entity_type == "reminder":
+            reminder = db.delete_reminder(int(entity_id))
+            title = reminder["title"] if reminder else "Reminder"
+            await update.message.reply_text(f"🗑 Deleted reminder: *{title}*", parse_mode="Markdown")
+
+        elif entity_type == "cal_event":
+            # Delete from Google Calendar
+            try:
+                calendar_client.delete_event(entity_id)
+                await update.message.reply_text("🗑 Deleted calendar event.")
+            except Exception as exc:
+                await update.message.reply_text(f"⚠️ Couldn't delete calendar event: {exc}")
+
+        else:
+            await update.message.reply_text("⚠️ Unknown entity type.")
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Delete failed: {exc}")
+
+    context.user_data["state"] = "idle"
+    context.user_data.pop("reply_delete", None)
+
+
+# ── REPLY-BASED UPDATE HANDLER ──────────────────────────────────────────────
+
+async def _reply_update_value(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Handle the update value from a reply-based update flow."""
+    data = context.user_data.get("reply_update")
+    if not data:
+        context.user_data["state"] = "idle"
+        await update.message.reply_text("⚠️ Nothing to update right now.")
+        return
+
+    entity_type = data["entity_type"]
+    entity_id = data["entity_id"]
+    text_stripped = text.strip()
+    text_lower = text_stripped.lower()
+
+    # Cancel
+    if text_lower in ("cancel", "stop", "nevermind"):
+        context.user_data["state"] = "idle"
+        context.user_data.pop("reply_update", None)
+        await update.message.reply_text("❌ Update cancelled.")
+        return
+
+    new_dt = nlp.extract_datetime(text_stripped)
+    title_prefix = re.match(r"^title:\s*(.+)$", text_stripped, re.IGNORECASE)
+    time_prefix = re.match(r"^time:\s*(.+)$", text_stripped, re.IGNORECASE)
+
+    try:
+        if entity_type == "task":
+            task = db.get_task(int(entity_id))
+            if not task:
+                await update.message.reply_text("⚠️ That task no longer exists.")
+                context.user_data["state"] = "idle"
+                context.user_data.pop("reply_update", None)
+                return
+
+            updates = {}
+            if time_prefix:
+                dt = nlp.extract_datetime(time_prefix.group(1))
+                if dt:
+                    updates["deadline"] = dt.date().isoformat()
+                else:
+                    await update.message.reply_text("Couldn't parse that time. Try `time: next Friday`.")
+                    return
+            elif title_prefix:
+                updates["title"] = title_prefix.group(1).strip().capitalize()
+            elif new_dt:
+                updates["deadline"] = new_dt.date().isoformat()
+            elif len(text_stripped) > 2:
+                updates["title"] = text_stripped
+
+            if updates:
+                db.update_task(task["id"], **updates)
+                if "title" in updates and task["calendar_event_id"]:
+                    try:
+                        calendar_client.update_event(task["calendar_event_id"], title=updates["title"])
+                    except Exception:
+                        pass
+                task = db.get_task(task["id"])
+                await update.message.reply_text(
+                    f"✏️ *Task Updated*\n\n{_fmt_entity('task', task)}"
+                    f"{_entity_ref_line('task', task['id'])}",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text("Couldn't parse that. Use `time: <datetime>` or `title: <new name>`.")
+                return
+
+        elif entity_type == "reminder":
+            reminder = db.get_reminder(int(entity_id))
+            if not reminder:
+                await update.message.reply_text("⚠️ That reminder no longer exists.")
+                context.user_data["state"] = "idle"
+                context.user_data.pop("reply_update", None)
+                return
+
+            if time_prefix:
+                dt = nlp.extract_datetime(time_prefix.group(1))
+                if dt:
+                    db.update_reminder(reminder["id"], remind_at=dt.isoformat())
+                else:
+                    await update.message.reply_text("Couldn't parse that time. Try `time: tomorrow 4pm`.")
+                    return
+            elif title_prefix:
+                db.update_reminder(reminder["id"], title=title_prefix.group(1).strip().capitalize())
+            elif new_dt:
+                db.update_reminder(reminder["id"], remind_at=new_dt.isoformat())
+            elif len(text_stripped) > 2:
+                db.update_reminder(reminder["id"], title=text_stripped)
+            else:
+                await update.message.reply_text("Couldn't parse that. Use `time: <datetime>` or `title: <new name>`.")
+                return
+
+            reminder = db.get_reminder(reminder["id"])
+            await update.message.reply_text(
+                f"✅ *Reminder Updated*\n\n{_fmt_entity('reminder', reminder)}"
+                f"{_entity_ref_line('reminder', reminder['id'])}",
+                parse_mode="Markdown",
+            )
+
+        elif entity_type == "cal_event":
+            dt = new_dt
+            if time_prefix:
+                dt = nlp.extract_datetime(time_prefix.group(1))
+
+            if not dt:
+                await update.message.reply_text("Couldn't parse that time. Try `time: tomorrow 6pm`.")
+                return
+
+            try:
+                dur = calendar_client.reschedule_event(entity_id, dt)
+                end = dt + timedelta(minutes=dur)
+                db.update_task_schedule_by_event(entity_id, dt.isoformat(), end.isoformat())
+                await update.message.reply_text(
+                    f"✅ *Calendar Event Updated*\n\n"
+                    f"New time: {_fmt_dt(dt)} → {end.strftime('%I:%M %p')}"
+                    f"{_entity_ref_line('cal_event', entity_id)}",
+                    parse_mode="Markdown",
+                )
+            except Exception as exc:
+                await update.message.reply_text(f"⚠️ Couldn't update calendar event: {exc}")
+
+        else:
+            await update.message.reply_text("⚠️ Unknown entity type.")
+
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Update failed: {exc}")
+
+    context.user_data["state"] = "idle"
+    context.user_data.pop("reply_update", None)
 
 
 # ── UPDATE ─────────────────────────────────────────────────────────────────────
