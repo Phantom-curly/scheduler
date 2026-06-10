@@ -35,25 +35,18 @@ Planning Bot is a personal task management system that accepts natural language 
 ### Context Diagram
 
 ```mermaid
-C4Context
-  title System Context — Planning Bot
+flowchart LR
+  User["User\n(Single person managing\ntasks & calendar)"]
+  Telegram["Telegram Bot API\n(Message delivery & inline UI)"]
+  Bot["Planning Bot\n(Task management, scheduling,\nGoogle Calendar integration)"]
+  GoogleCal["Google Calendar API\n(Event CRUD & reminders)"]
+  OpenRouter["OpenRouter / Gemini API\n(AI parsing & recommendations)"]
 
-  Person(user, "User", "Single user managing personal tasks and calendar via Telegram")
-
-  System_Boundary(bot, "Planning Bot System") {
-    System(planner, "Planning Telegram Bot", "Task management, smart scheduling, Google Calendar integration")
-  }
-
-  System_Ext(telegram, "Telegram Bot API", "Message delivery and inline UI")
-  System_Ext(gcal, "Google Calendar API", "Event CRUD and reminders")
-  System_Ext(llm_ext, "OpenRouter / Gemini API", "Optional AI-powered parsing and recommendations")
-
-  Rel(user, telegram, "Sends messages, receives notifications")
-  Rel(telegram, planner, "Webhook/polling relay")
-  Rel(planner, gcal, "Create, read, update, delete calendar events")
-  Rel(planner, llm_ext, "Parse complex intents, generate suggestions")
-  Rel(planner, telegram, "Respond to user")
-  UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+  User -- "Sends messages,\nreceives notifications" --> Telegram
+  Telegram -- "Long polling relay" --> Bot
+  Bot -- "Responds with text,\nmarkdown, inline buttons" --> Telegram
+  Bot -- "Create, read, update,\ndelete calendar events" --> GoogleCal
+  Bot -. "Parse complex intents,\ngenerate suggestions" .-> OpenRouter
 ```
 
 **How it works:** The user sends a Telegram message to the bot. The message flows through Telegram's infrastructure to the running Python application. The bot parses the intent (either via regex NLP or via Gemini LLM), executes the appropriate handler (add task, list tasks, schedule into calendar, etc.), and sends a response back through Telegram.
@@ -65,40 +58,39 @@ C4Context
 ### Container Diagram
 
 ```mermaid
-C4Container
-  title Container Diagram — Planning Bot
+flowchart TB
+  User["User\n(Telegram user)"]
+  Telegram["Telegram Bot API"]
 
-  Person(user, "User", "Telegram user")
+  subgraph Bot["Planning Bot — Python Application"]
+    direction TB
+    BotLayer["Telegram Bot Layer\nbot.py\nCommand handlers, message router,\nstate machine, callback handler"]
+    NLP["NLP Parser (Regex)\nnlp.py\nIntent detection, datetime/duration/\nrecurrence extraction"]
+    LLM["LLM Gateway\nllm.py\nGemini parsing via OpenRouter,\ncalendar query answering"]
+    Scheduler["Scheduler Engine\nscheduler.py\n9 APScheduler jobs: morning, evening,\nweekly, reminders, overdue, cleanup"]
+    SmartSched["Smart Scheduling\nsmart_schedule.py\nFree slot finder, task scoring,\ngreedy planner with split support"]
+    CalClient["Calendar Client\ncalendar_client.py\nOAuth, token refresh,\nGoogle Calendar CRUD"]
+    DB["Database Layer\ndb.py\nSQLite: tasks, habits,\nreminders, sent_reminders"]
+  end
 
-  System_Boundary(bot, "Planning Bot") {
-    Container(bot_py, "Telegram Bot Layer", "Python / python-telegram-bot", "Command handlers, message router, state machine, callback handler")
-    Container(nlp_regex, "NLP Parser (Regex)", "Python / dateparser", "Intent detection, datetime/duration/recurrence extraction")
-    Container(llm_gateway, "LLM Gateway", "Python / requests", "Gemini parsing via OpenRouter, calendar query answering, recommendation generation")
-    Container(scheduler_engine, "Scheduler Engine", "Python / APScheduler", "9 automated jobs: morning, evening, weekly, reminders, overdue lifecycle, stale cleanup")
-    Container(smart_sched, "Smart Scheduling", "Python", "Free slot finder, task scoring, greedy planner with split support")
-    Container(cal_client, "Calendar Client", "Python / google-api-python-client", "OAuth, token refresh, Google Calendar CRUD")
-    Container(db, "Database Layer", "Python / SQLite", "Tasks, habits, reminders, sent_reminders tables")
-  }
+  GoogleCal["Google Calendar API"]
+  OpenRouter["OpenRouter / Gemini"]
 
-  System_Ext(telegram, "Telegram Bot API")
-  System_Ext(gcal, "Google Calendar API")
-  System_Ext(llm_ext, "OpenRouter / Gemini")
-
-  Rel(user, telegram, "Sends/receives messages")
-  Rel(telegram, bot_py, "Updates via long polling")
-  Rel(bot_py, nlp_regex, "Parse message intent", "nlp.parse_message()")
-  Rel(bot_py, llm_gateway, "LLM parse fallback", "llm.parse() + llm.normalise()")
-  Rel(bot_py, db, "CRUD tasks, habits, reminders", "db module")
-  Rel(bot_py, cal_client, "Schedule events", "calendar_client.create_event()")
-  Rel(bot_py, smart_sched, "Find free slots, plan tasks", "smart_schedule.get_free_slots()")
-  Rel(bot_py, scheduler_engine, "Register background jobs", "setup_scheduler() in main()")
-  Rel(smart_sched, cal_client, "Query upcoming events", "calendar_client.list_upcoming_events()")
-  Rel(smart_sched, llm_ext, "AI slot suggestions", "suggest_slot()")
-  Rel(llm_gateway, llm_ext, "LLM API calls")
-  Rel(cal_client, gcal, "HTTP REST", "Google Calendar v3 API")
-  Rel(scheduler_engine, db, "Read tasks/habits/reminders", "db module")
-  Rel(scheduler_engine, cal_client, "Fetch events for reminders", "calendar_client.get_events_starting_soon()")
-  UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+  User --> Telegram
+  Telegram --> BotLayer
+  BotLayer --> NLP
+  BotLayer --> LLM
+  BotLayer --> DB
+  BotLayer --> CalClient
+  BotLayer --> SmartSched
+  BotLayer --> Scheduler
+  Scheduler --> DB
+  Scheduler --> CalClient
+  SmartSched --> CalClient
+  SmartSched --> OpenRouter
+  LLM --> OpenRouter
+  LLM --> NLP
+  CalClient --> GoogleCal
 ```
 
 #### Container Descriptions
@@ -231,55 +223,45 @@ graph TD
 ### Deployment
 
 ```mermaid
-deployment
-    title Deployment — Planning Bot on Linux VPS
+flowchart TB
+  subgraph UserDevice["User Device"]
+    TGClient["Telegram Client"]
+  end
 
-    node "User Device" as user_dev {
-        node "Telegram Client" as tg_client
-    }
+  subgraph External["External Services"]
+    TGPlatform["Telegram Platform"]
+    GoogleAPI["Google Calendar API"]
+    GeminiAPI["OpenRouter / Gemini API"]
+  end
 
-    node "Internet" as internet {
-        node "Telegram Platform" as tg_platform
-        node "Google APIs" as google {
-            node "Google Calendar API" as gcal_api
-        }
-        node "OpenRouter" as openrouter {
-            node "Gemini API" as gemini_api
-        }
-    }
+  subgraph VPS["Linux VPS (Ubuntu/Debian)"]
+    subgraph SystemD["systemd"]
+      Service["planner-bot.service"]
+    end
 
-    node "Linux VPS (Ubuntu/Debian)" as vps {
-        node "systemd" as systemd {
-            node "planner-bot.service" as service
-        }
+    subgraph PythonRuntime["Python Runtime 3.10+"]
+      BotMain["bot.py\n(entry point)"]
+      SchedulerJobs["scheduler jobs\n(9 APScheduler tasks)"]
+    end
 
-        node "Python Runtime 3.10+" as python {
-            node "Main Process" as bot_process {
-                node "bot.py" as bot_main
-                node "scheduler jobs" as jobs
-            }
-        }
+    subgraph FileSystem["File System"]
+      EnvFile[".env\n(environment variables)"]
+      TokenFile["token.json\n(Google OAuth credentials)"]
+      DBFile["planner.db\n(SQLite database)"]
+    end
+  end
 
-        node "File System" as fs {
-            node "/opt/planner_bot/" as app_dir {
-                node ".env" as env_file
-                node "token.json" as token_file
-            }
-            node "SQLite Database" as db_file
-        }
-    }
-
-    tg_client --> tg_platform
-    tg_platform --> bot_main
-    bot_main --> tg_platform
-    bot_main --> gcal_api
-    bot_main --> gemini_api
-    bot_main --> db_file
-    jobs --> gcal_api
-    jobs --> db_file
-    env_file --> bot_main
-    token_file --> bot_main
-    service --> bot_process
+  TGClient --> TGPlatform
+  TGPlatform --> BotMain
+  BotMain --> TGPlatform
+  BotMain --> GoogleAPI
+  BotMain --> GeminiAPI
+  BotMain --> DBFile
+  SchedulerJobs --> GoogleAPI
+  SchedulerJobs --> DBFile
+  EnvFile --- BotMain
+  TokenFile --- BotMain
+  Service --- PythonRuntime
 ```
 
 **Production setup:** The bot runs as a systemd service on a headless Linux VPS (Ubuntu/Debian). The `oracle-planner.service` unit sets `WorkingDirectory=/opt/planner_bot`, loads `.env` as the environment file, and runs `venv/bin/python bot.py` with automatic restart on failure. The Google Calendar `token.json` is generated locally via `auth_calendar.py` (which requires a browser for OAuth consent) and then copied to the server via SCP. The SQLite database persists tasks, habits, and reminders. All three external services (Telegram, Google Calendar, OpenRouter) are accessed over HTTPS outbound — no inbound ports are required beyond standard SSH for administration.
