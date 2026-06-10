@@ -254,8 +254,8 @@ async def _handle_reply_edit(update, context) -> bool:
             )
             return True
 
-        # Plain text → new title (if long enough)
-        if len(text) > 2 and text_lower not in ("yes", "no", "ok", "cancel", "done", "y", "n"):
+        # Plain text → new title (if long enough, not a command keyword)
+        if len(text) > 2 and not _is_command_keyword(text):
             db.update_reminder(reminder["id"], title=text)
             reminder = db.get_reminder(reminder["id"])
             await update.message.reply_text(
@@ -294,8 +294,8 @@ async def _handle_reply_edit(update, context) -> bool:
         if not title_prefix and not time_prefix and new_dt:
             updates["deadline"] = new_dt.date().isoformat()
 
-        # Plain text (no datetime, no prefix) → new title
-        if not updates and len(text) > 2 and text_lower not in ("yes", "no", "ok", "cancel", "done", "y", "n"):
+        # Plain text (no datetime, no prefix) → new title (not a command keyword)
+        if not updates and len(text) > 2 and not _is_command_keyword(text):
             updates["title"] = text
 
         if updates:
@@ -358,20 +358,42 @@ async def _handle_reply_edit(update, context) -> bool:
     return False
 
 
+# Known command words that should never be treated as valid titles
+_COMMAND_KEYWORDS = frozenset({
+    "yes", "no", "ok", "cancel", "done", "y", "n",
+    "delete", "remove", "del", "rm", "🗑",
+    "update", "edit", "change", "modify", "✏️",
+    "stop", "nevermind", "skip",
+    "title", "time", "rename",
+})
+
+
+def _is_command_keyword(text: str) -> bool:
+    """Check if text looks like a command word, not a real title."""
+    return text.lower().strip() in _COMMAND_KEYWORDS
+
+
 def _get_entity_title(entity_type: str, entity_id) -> Optional[str]:
-    """Get a human-readable title for an entity by its type and id."""
+    """Get a human-readable title for an entity by its type and id.
+    Returns None if the title looks like a corrupted command keyword."""
     try:
         if entity_type == "task":
             t = db.get_task(int(entity_id))
-            return t["title"] if t else None
+            title = t["title"] if t else None
         elif entity_type == "reminder":
             r = db.get_reminder(int(entity_id))
-            return r["title"] if r else None
+            title = r["title"] if r else None
         elif entity_type == "cal_event":
             return "calendar event"  # generic; can't search by id
+        else:
+            return None
+        # If the title is just a command keyword, it was likely corrupted by
+        # the old reply handler that didn't exclude command words
+        if title and _is_command_keyword(title):
+            return None
+        return title
     except Exception:
         return None
-    return None
 
 
 # ── Commands ───────────────────────────────────────────────────────────────────
