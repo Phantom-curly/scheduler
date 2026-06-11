@@ -213,7 +213,8 @@ _NEXT_WEEK_DAY_RE = re.compile(
 
 
 def _next_weekday(name: str, force_next: bool = False, add_weeks: int = 0) -> datetime:
-    today      = datetime.now()
+    tz         = pytz.timezone(TIMEZONE)
+    today      = datetime.now(tz)
     target     = _DAYS[name.lower()]
     days_ahead = (target - today.weekday()) % 7
     if days_ahead == 0 or force_next:
@@ -230,6 +231,7 @@ def _default_morning(dt: datetime) -> datetime:
 
 def _parse_date_phrase(phrase: str) -> Optional[datetime]:
     phrase = phrase.strip()
+    tz     = pytz.timezone(TIMEZONE)
     
     # "next week monday", "this week friday"
     m = _NEXT_WEEK_DAY_RE.match(phrase)
@@ -253,11 +255,11 @@ def _parse_date_phrase(phrase: str) -> Optional[datetime]:
     
     # "tomorrow" → tomorrow at 9 AM
     if phrase.lower() == "tomorrow":
-        now = datetime.now()
+        now = datetime.now(tz)
         return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
     
     if phrase.lower() in ("today", "tonight"):
-        return datetime.now()
+        return datetime.now(tz)
     
     return dateparser.parse(phrase, settings={"PREFER_DATES_FROM": "future", "PREFER_DAY_OF_MONTH": "first"})
 
@@ -317,7 +319,7 @@ def resolve_time_of_day(text: str, now: Optional[datetime] = None) -> Optional[d
       "evening"     → today 8:00 PM
     """
     if now is None:
-        now = datetime.now()
+        now = datetime.now(pytz.timezone(TIMEZONE))
     
     m = _TIMES_OF_DAY_RE.search(text)
     if not m:
@@ -348,7 +350,7 @@ _NTH_OF_MONTH_RE = re.compile(
 def resolve_nth_of_month(text: str, now: Optional[datetime] = None) -> Optional[datetime]:
     """Resolve patterns like '17th of next month' or '3rd of this month'."""
     if now is None:
-        now = datetime.now()
+        now = datetime.now(pytz.timezone(TIMEZONE))
     
     m = _NTH_OF_MONTH_RE.search(text)
     if not m:
@@ -523,7 +525,7 @@ def extract_datetime(text: str) -> Optional[datetime]:
         amount = int(m.group(1))
         unit   = m.group(2).lower()
         delta  = timedelta(hours=amount) if "h" in unit else timedelta(minutes=amount)
-        return datetime.now() + delta
+        return datetime.now(pytz.timezone(TIMEZONE)) + delta
     
     # ─── Step 0c: Time-of-day word alone ────────────────────────────────────
     # e.g. "at lunch", "in the evening", "morning"
@@ -541,7 +543,7 @@ def extract_datetime(text: str) -> Optional[datetime]:
         amount = int(m.group(1))
         unit   = m.group(2).lower()
         delta  = timedelta(weeks=amount) if "week" in unit else timedelta(days=amount)
-        result = datetime.now() + delta
+        result = datetime.now(pytz.timezone(TIMEZONE)) + delta
         # In deadline context, "in 2 days" means end of that day (23:59)
         if is_deadline:
             return _end_of_day(result)
@@ -553,12 +555,12 @@ def extract_datetime(text: str) -> Optional[datetime]:
     if m:
         phrase = m.group(2).lower()
         if "after tomorrow" in phrase:
-            result = datetime.now() + timedelta(days=2)
+            result = datetime.now(pytz.timezone(TIMEZONE)) + timedelta(days=2)
             if is_deadline:
                 return _end_of_day(result)
             return _default_morning(result)
         if "before yesterday" in phrase:
-            return _default_morning(datetime.now() - timedelta(days=2))
+            return _default_morning(datetime.now(pytz.timezone(TIMEZONE)) - timedelta(days=2))
         return None
     
     # ─── Step 0f: Nth of month ──────────────────────────────────────────────
@@ -575,7 +577,7 @@ def extract_datetime(text: str) -> Optional[datetime]:
     if m:
         dt = dateparser.parse(m.group(1), settings={"PREFER_DATES_FROM": "future"})
         if dt:
-            now = datetime.now()
+            now = datetime.now(pytz.timezone(TIMEZONE))
             return now.replace(hour=dt.hour, minute=dt.minute, second=0, microsecond=0)
     
     # ─── Step 1: Explicit markers ───────────────────────────────────────────
@@ -622,7 +624,7 @@ def extract_duration(text: str) -> Optional[int]:
             start_dt = dateparser.parse(start_str, settings={"PREFER_DATES_FROM": "future"})
             end_dt   = dateparser.parse(end_str,   settings={"PREFER_DATES_FROM": "future"})
             if start_dt and end_dt:
-                now = datetime.now()
+                now = datetime.now(pytz.timezone(TIMEZONE))
                 start = now.replace(hour=start_dt.hour, minute=start_dt.minute, second=0, microsecond=0)
                 end   = now.replace(hour=end_dt.hour, minute=end_dt.minute, second=0, microsecond=0)
                 # If end is before start, assume it crosses midnight (e.g. 9pm to 11pm won't, but 10pm to 2am would)

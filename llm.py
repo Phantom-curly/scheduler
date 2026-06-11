@@ -115,7 +115,9 @@ def parse(text: str, conversation_context: str = "") -> Optional[Dict[str, Any]]
     if not OPENROUTER_API_KEY:
         return None
 
-    today  = datetime.now().strftime("%Y-%m-%d %A")
+    import pytz
+    tz     = pytz.timezone(os.getenv("TIMEZONE", "Asia/Seoul"))
+    today  = datetime.now(tz).strftime("%Y-%m-%d %A")
     system = _SYSTEM.format(today=today)
 
     messages = [{"role": "system", "content": system}]
@@ -255,7 +257,9 @@ def answer_calendar_query(query: str, events: list, tasks: list) -> str:
     if not OPENROUTER_API_KEY:
         return "I can't answer calendar questions without the LLM configured."
 
-    today = datetime.now().strftime("%Y-%m-%d %A")
+    import pytz
+    tz    = pytz.timezone(os.getenv("TIMEZONE", "Asia/Seoul"))
+    today = datetime.now(tz).strftime("%Y-%m-%d %A")
 
     events_text = "\n".join(
         f"- {e.get('summary','?')} at {e.get('start',{}).get('dateTime','?')}"
