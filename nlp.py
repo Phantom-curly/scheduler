@@ -930,13 +930,15 @@ def parse_message(text: str) -> Dict:
     if intent in ("add", "schedule", "schedule_direct", "batch_schedule", "update"):
         result["datetime"]    = extract_datetime(text)
         result["title"]       = extract_task_title(text)
-        result["duration"]    = extract_duration(text)
         result["reminder"]    = extract_reminder_minutes(text)
         result["recurrence"]  = extract_recurrence(text)
         result["multi_slots"] = extract_multi_slots(text)
-        result["category"]    = infer_category(text)
-        result["energy"]      = infer_energy(text, result["category"])
-        result["splittable"]  = infer_splittable(text, result["duration"], result["category"])
+        # duration, category, energy, splittable omitted for "add" — user sets those when scheduling
+        if intent != "add":
+            result["duration"]    = extract_duration(text)
+            result["category"]    = infer_category(text)
+            result["energy"]      = infer_energy(text, result["category"])
+            result["splittable"]  = infer_splittable(text, result["duration"], result["category"])
 
     if intent in ("free_time", "plan"):
         result["datetime"] = extract_datetime(text)

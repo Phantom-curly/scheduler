@@ -888,20 +888,12 @@ async def _add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: 
     titles    = parsed.get("titles")
     deadlines = parsed.get("deadlines")
     priority  = parsed.get("priority", "medium") or "medium"
-    duration  = parsed.get("duration", 60)
-    category  = parsed.get("category", "general")
-    energy    = parsed.get("energy", "medium")
-    splittable = parsed.get("splittable", False)
 
     if titles and len(titles) > 1:
         added = []
         for i, t in enumerate(titles):
             dl  = deadlines[i] if deadlines and i < len(deadlines) else None
-            tid = db.add_task(
-                title=t, deadline=dl, priority=priority,
-                estimated_minutes=duration, category=category,
-                energy=energy, splittable=splittable,
-            )
+            tid = db.add_task(title=t, deadline=dl, priority=priority)
             due = f" — due {_fmt_deadline(dl)}" if dl else ""
             added.append(f"  {PRIORITY_ICON[priority]} {t}{due} (#{tid})")
         await update.message.reply_text(
@@ -918,15 +910,7 @@ async def _add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: 
         return
 
     deadline_str = dt.date().isoformat() if dt else None
-    task_id      = db.add_task(
-        title=title,
-        deadline=deadline_str,
-        priority=priority,
-        estimated_minutes=duration,
-        category=category,
-        energy=energy,
-        splittable=splittable,
-    )
+    task_id      = db.add_task(title=title, deadline=deadline_str, priority=priority)
     p_icon       = PRIORITY_ICON.get(priority, "🟡")
 
     # Store for potential deadline clarification follow-up
@@ -937,7 +921,6 @@ async def _add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: 
 
     reply  = f"✅ *Task added!*\n\n{p_icon} *{title}*\n"
     reply += f"Due: {_fmt_deadline(deadline_str)}\n" if deadline_str else "No deadline set — reply `deadline is [date]` to add one\n"
-    reply += f"Estimate: {duration} min · {category} · {energy} energy\n"
     reply += f"Priority: {priority}\n"
     reply += f"ID: #{task_id}"
     reply += _entity_ref_line("task", task_id)
