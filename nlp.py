@@ -761,6 +761,8 @@ def infer_splittable(text: str, duration: int, category: str = None) -> bool:
         return True
     if category in ("fitness", "meeting", "errand"):
         return False
+    if duration is None:
+        return False
     return duration >= 120
 
 
