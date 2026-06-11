@@ -516,6 +516,19 @@ def extract_datetime(text: str) -> Optional[datetime]:
                     if hour is not None:
                         return day_dt.replace(hour=hour, minute=0, second=0, microsecond=0)
         else:
+            # Parse day and explicit time separately using timezone-aware functions.
+            # dateparser doesn't know KST, so "today at 2:37 am" gets the wrong UTC day.
+            day_time_match = re.match(
+                r"((?:next\s+|this\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun|tomorrow|today))"
+                r"\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm))",
+                group, re.IGNORECASE
+            )
+            if day_time_match:
+                day_dt = _parse_date_phrase(day_time_match.group(1))
+                time_str = day_time_match.group(2)
+                time_dt = dateparser.parse(time_str, settings={"PREFER_DATES_FROM": "future"})
+                if day_dt and time_dt:
+                    return day_dt.replace(hour=time_dt.hour, minute=time_dt.minute, second=0, microsecond=0)
             dt = dateparser.parse(group, settings={"PREFER_DATES_FROM": "future"})
             if dt:
                 return dt
