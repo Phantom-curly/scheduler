@@ -486,6 +486,8 @@ def extract_datetime(text: str) -> Optional[datetime]:
       - "in 2 days" → date at 23:59 (end of day)
       - Bare day name → day at 23:59 (end of day)
     """
+    # Normalize period-as-separator in times: "2.11 am" → "2:11 am"
+    text = re.sub(r"(\d)\.(\d{2})\s*(am|pm)", r"\1:\2 \3", text, flags=re.IGNORECASE)
     
     is_deadline = _is_deadline_context(text)
     
