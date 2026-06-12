@@ -115,6 +115,11 @@ def _entity_ref_line(entity_type: str, entity_id) -> str:
 
 def _fmt_entity(entity_type: str, entity) -> str:
     """Format an entity's current state for the edit-confirmation message."""
+    # sqlite3.Row doesn't support .get(), convert to dict
+    if entity is not None:
+        entity = dict(entity)
+    else:
+        entity = {}
     lines = []
     if entity_type == "task":
         title = entity.get("title", "?")
