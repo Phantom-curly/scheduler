@@ -471,6 +471,27 @@ def update_reminder(reminder_id, **kwargs):
         conn.commit()
 
 
+def get_active_reminders(limit=20):
+    """Get all active reminders, nearest first."""
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT * FROM reminders WHERE active = 1 ORDER BY remind_at ASC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
+
+def get_reminders_by_period(start_date, end_date):
+    """Get active reminders whose remind_at falls within the date range."""
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT * FROM reminders
+               WHERE active = 1
+                 AND remind_at >= ? AND remind_at < ?
+               ORDER BY remind_at ASC""",
+            (start_date.isoformat(), (end_date + timedelta(days=1)).isoformat()),
+        ).fetchall()
+
+
 def complete_app_reminder(reminder_id, sent_at, next_remind_at=None):
     with get_conn() as conn:
         if next_remind_at:
