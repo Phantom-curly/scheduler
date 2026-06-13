@@ -483,7 +483,9 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
-    today  = datetime.now().date()
+    import pytz
+    tz    = pytz.timezone(os.getenv("TIMEZONE", "Asia/Seoul"))
+    today = datetime.now(tz).date()
     tasks  = db.get_tasks_by_period(today, today)
     lines  = [f"📅 *Today — {today.strftime('%A %b %d')}*\n"]
 
@@ -503,6 +505,19 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"  • *{title}* — {calendar_client.fmt_event_time_range(e)}")
     except Exception:
         pass
+
+    # Show reminders for today
+    reminders = db.get_reminders_by_period(today, today)
+    if reminders:
+        lines.append("\n⏰ *Reminders:*")
+        for r in reminders:
+            try:
+                dt = datetime.fromisoformat(r["remind_at"])
+                time_str = dt.strftime("%I:%M %p").lstrip("0")
+            except Exception:
+                time_str = r["remind_at"]
+            recur_tag = " 🔁" if r["recurrence_rrule"] else ""
+            lines.append(f"  • 🔔 {r['title']} — {time_str}{recur_tag}")
 
     if len(lines) == 1:
         lines.append("Nothing on the plate today! 🎉")
@@ -534,6 +549,19 @@ async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"  • *{title}* — {calendar_client.fmt_event_time_range(e)}")
     except Exception:
         pass
+
+    # Show reminders for tomorrow
+    reminders = db.get_reminders_by_period(tomorrow, tomorrow)
+    if reminders:
+        lines.append("\n⏰ *Reminders:*")
+        for r in reminders:
+            try:
+                dt = datetime.fromisoformat(r["remind_at"])
+                time_str = dt.strftime("%I:%M %p").lstrip("0")
+            except Exception:
+                time_str = r["remind_at"]
+            recur_tag = " 🔁" if r["recurrence_rrule"] else ""
+            lines.append(f"  • 🔔 {r['title']} — {time_str}{recur_tag}")
 
     if len(lines) == 1:
         lines.append("Nothing on the plate tomorrow! 🎉")
@@ -593,6 +621,26 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  _...and {len(unscheduled)-5} more_")
 
     context.user_data["last_task_list"] = [dict(t) for t in db.get_unscheduled_tasks_sorted()]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    reminders = db.get_active_reminders()
+    if not reminders:
+        await update.message.reply_text("⏰ No active reminders.")
+        return
+    lines = [f"⏰ *Active Reminders* ({len(reminders)})\n"]
+    for i, r in enumerate(reminders):
+        try:
+            dt = datetime.fromisoformat(r["remind_at"])
+            time_str = _fmt_dt(dt)
+        except Exception:
+            time_str = r["remind_at"]
+        recur_tag = " 🔁" if r["recurrence_rrule"] else ""
+        lines.append(f"  {i+1}. 🔔 {r['title']} — {time_str}{recur_tag} (#{r['id']})")
+    lines.append("\n_Reply to a reminder message to edit/delete it_")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -839,6 +887,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "habit_list":     lambda u, c, *_: cmd_habits(u, c),
         "habit_delete":   _habit_delete,
         "reminder":       _reminder_intent,
+        "reminder_list":  lambda u, c, *_: cmd_reminders(u, c),
         "free_time":      _free_time_intent,
         "plan":           _plan_tasks_intent,
         "calendar_query": _calendar_query,
@@ -2499,6 +2548,7 @@ def main():
     app.add_handler(CommandHandler("plan",     cmd_plan))
     app.add_handler(CommandHandler("now",      cmd_now))
     app.add_handler(CommandHandler("cancel",   cmd_cancel))
+    app.add_handler(CommandHandler("reminders", cmd_reminders))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
