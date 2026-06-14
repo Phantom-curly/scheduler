@@ -1,11 +1,40 @@
-"""
-Smart scheduling — free slot finder + AI-powered recommendations.
+# Copyright (c) 2026 Planning Bot Contributors
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
-Logic:
-- Sleep window blocked (23:00 - 07:00)
-- Meal times soft-blocked (07:30-08:30, 12:00-13:00, 18:30-19:30)
-- Task-type awareness: focus work → morning, gym/exercise → morning or evening
-- Generates natural language recommendations via Gemini
+"""
+Smart scheduling engine — free slot detection, task scoring, greedy planning, and
+AI-powered recommendations.
+
+Provides three layers of scheduling logic:
+
+1. **Free slot finder**: Queries Google Calendar for existing events, builds busy
+   blocks, and computes free windows within waking hours (07:00–23:00). Sleep
+   (23:00–07:00) is hard-blocked; meal times are soft-blocked.
+
+2. **Task scoring and greedy planner**: Scores each task-slot pair on deadline
+   pressure, category/time-of-day fit, energy level, and priority. Assigns tasks
+   greedily, supporting split placement for large tasks.
+
+3. **AI recommendation**: Optional Gemini 2.5 Flash Lite via OpenRouter for
+   single-slot suggestions, weekly plans, daily recommendations, and weekly
+   reviews.
 """
 
 import os, logging, re, json
@@ -22,10 +51,11 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 MODEL              = "google/gemini-2.5-flash-lite"
 API_URL            = "https://openrouter.ai/api/v1/chat/completions"
 
-# ── Blocked windows (hour, minute) tuples ────────────────────────────────────
-
+# Hard-blocked: sleep window (no tasks assigned during these hours)
 SLEEP_START  = (23, 0)
 SLEEP_END    = (7,  0)
+
+# Soft-blocked: meal times (avoided when possible but not strictly prohibited)
 SOFT_BLOCKS  = [          # (start_h, start_m, end_h, end_m, label)
     (7, 30,  8, 30,  "breakfast"),
     (12, 0, 13,  0,  "lunch"),
@@ -34,11 +64,27 @@ SOFT_BLOCKS  = [          # (start_h, start_m, end_h, end_m, label)
 
 
 def _is_sleep(dt: datetime) -> bool:
+    """Check whether *dt* falls within the hard-blocked sleep window (23:00–07:00).
+
+    Args:
+        dt: A timezone-aware datetime.
+
+    Returns:
+        bool: ``True`` if the time is between 23:00 and 07:00.
+    """
     h = dt.hour
     return h >= SLEEP_START[0] or h < SLEEP_END[0]
 
 
 def _is_soft_blocked(dt: datetime) -> bool:
+    """Check whether *dt* falls within any of the soft-blocked meal windows.
+
+    Args:
+        dt: A timezone-aware datetime.
+
+    Returns:
+        bool: ``True`` if the time falls within a meal window.
+    """
     for sh, sm, eh, em, _ in SOFT_BLOCKS:
         start = dt.replace(hour=sh, minute=sm, second=0, microsecond=0)
         end   = dt.replace(hour=eh, minute=em, second=0, microsecond=0)
@@ -49,14 +95,28 @@ def _is_soft_blocked(dt: datetime) -> bool:
 
 # ── Free slot finder ──────────────────────────────────────────────────────────
 
+
 def get_free_slots(
     days_ahead:       int  = 5,
     min_duration_min: int  = 30,
     respect_soft:     bool = True,
 ) -> List[Dict]:
-    """
-    Returns free slots respecting sleep and optionally meal times.
-    Each slot: {start, end, duration_minutes, label}
+    """Find free calendar slots within the next *days_ahead* days.
+
+    Queries Google Calendar for existing events, builds busy blocks, then
+    computes free windows within waking hours (07:00–23:00). Sleep is always
+    excluded; meal times are optionally excluded based on ``respect_soft``.
+
+    Args:
+        days_ahead: How many days to check from today (default 5).
+        min_duration_min: Minimum slot duration in minutes (default 30).
+            Slots shorter than this are discarded.
+        respect_soft: If ``True`` (default), meal-time windows are removed
+            from the free slots.
+
+    Returns:
+        List[Dict]: Free slots, each with keys ``start``, ``end``,
+            ``duration_minutes``. Sorted chronologically, capped at 25 slots.
     """
     tz       = pytz.timezone(TIMEZONE)
     now      = datetime.now(tz)
@@ -93,11 +153,11 @@ def get_free_slots(
     for day_offset in range(days_ahead):
         day = (now + timedelta(days=day_offset)).date()
 
-        # Build waking window for this day
+        # Build waking window for this day (SLEEP_END → SLEEP_START)
         wake_start = tz.localize(datetime(day.year, day.month, day.day, SLEEP_END[0],  SLEEP_END[1]))
-        wake_end   = tz.localize(datetime(day.year, day.month, day.day, SLEEP_START[0],SLEEP_START[1]))
+        wake_end   = tz.localize(datetime(day.year, day.month, day.day, SLEEP_START[0], SLEEP_START[1]))
 
-        # Don't go before now
+        # Don't go before now (add 15 min buffer to avoid immediate scheduling)
         cursor = max(wake_start, now + timedelta(minutes=15))
         if cursor >= wake_end:
             continue
@@ -106,7 +166,7 @@ def get_free_slots(
 
         def add_slot(s, e):
             if respect_soft:
-                # Trim soft blocks from edges
+                # Trim soft-blocked meal windows from the slot edges
                 for sh, sm, eh, em, _ in SOFT_BLOCKS:
                     sb = s.replace(hour=sh, minute=sm, second=0, microsecond=0)
                     se = s.replace(hour=eh, minute=em, second=0, microsecond=0)
@@ -120,17 +180,29 @@ def get_free_slots(
             if dur >= min_duration_min:
                 free_slots.append({"start": s, "end": e, "duration_minutes": dur})
 
+        # Walk through busy blocks chronologically, adding gaps as free slots
         for busy_start, busy_end in day_busy:
             if cursor < busy_start:
                 add_slot(cursor, busy_start)
             cursor = max(cursor, busy_end)
 
+        # Add remaining time after the last busy block until sleep
         add_slot(cursor, wake_end)
 
     return free_slots[:25]
 
 
 def format_slots_for_display(slots: List[Dict], limit: int = 5) -> str:
+    """Format free slots into a human-readable string for Telegram messages.
+
+    Args:
+        slots: List of free slot dicts (from ``get_free_slots()``).
+        limit: Maximum number of slots to display (default 5).
+
+    Returns:
+        str: Newline-separated slot descriptions like
+            ``"1. Thu Jun 11, 2:00 PM – 3:30 PM (90 min free)"``.
+    """
     lines = []
     for i, s in enumerate(slots[:limit]):
         day   = s["start"].strftime("%a %b %d")
@@ -142,6 +214,16 @@ def format_slots_for_display(slots: List[Dict], limit: int = 5) -> str:
 
 
 def _task_minutes(task: Dict, fallback: int = 60) -> int:
+    """Extract the estimated duration of a task in minutes.
+
+    Args:
+        task: A task dict (from ``db.get_*``).
+        fallback: Default duration if ``estimated_minutes`` is missing or
+            invalid (default 60).
+
+    Returns:
+        int: Duration in minutes.
+    """
     try:
         return int(task.get("estimated_minutes") or fallback)
     except Exception:
@@ -149,6 +231,23 @@ def _task_minutes(task: Dict, fallback: int = 60) -> int:
 
 
 def _deadline_pressure(task: Dict, slot_start: datetime) -> int:
+    """Compute a deadline-pressure score for a task relative to a slot.
+
+    The score increases as the deadline approaches:
+        - Overdue: 90
+        - Due today: 70
+        - Due tomorrow: 45
+        - Due within 3 days: 25
+        - Due later: 5
+        - No deadline: 0
+
+    Args:
+        task: A task dict with an optional ``deadline`` field (ISO date).
+        slot_start: The datetime of the proposed slot.
+
+    Returns:
+        int: A score from 0 (no pressure) to 90 (critical).
+    """
     deadline = task.get("deadline")
     if not deadline:
         return 0
@@ -168,6 +267,29 @@ def _deadline_pressure(task: Dict, slot_start: datetime) -> int:
 
 
 def _slot_fit_score(task: Dict, slot: Dict) -> int:
+    """Score how well a task fits into a given free slot.
+
+    Evaluates multiple dimensions:
+        - **Duration**: Slot must be at least as long as the task's estimated
+          minutes (otherwise returns -10,000, which eliminates the slot).
+        - **Deadline pressure**: Urgent tasks score higher (0–90).
+        - **Priority**: High-priority tasks get +25, medium +10, low +0.
+        - **Slot waste**: Penalises slots that are much larger than the task.
+        - **Category/time-of-day fit**: Focus work → mornings, fitness →
+          morning/evening, meetings → business hours, errands → midday.
+        - **Energy level**: High-energy tasks penalised late at night.
+        - **Earliest start**: If the slot starts before ``earliest_start``,
+          returns -10,000.
+
+    Args:
+        task: A task dict with keys ``estimated_minutes``, ``category``,
+            ``energy``, ``priority``, ``earliest_start``.
+        slot: A free slot dict with keys ``start``, ``duration_minutes``.
+
+    Returns:
+        int: A score where higher is better. Negative values indicate a poor
+            or invalid fit; -10,000 means the slot is incompatible.
+    """
     minutes = _task_minutes(task)
     if slot["duration_minutes"] < minutes:
         return -10_000
@@ -181,10 +303,12 @@ def _slot_fit_score(task: Dict, slot: Dict) -> int:
     score += _deadline_pressure(task, start)
     score += {"high": 25, "medium": 10, "low": 0}.get(priority, 10)
 
+    # Penalise wasted slot space (every 30 min of excess reduces score)
     leftover = slot["duration_minutes"] - minutes
     score -= min(leftover // 30, 8)
 
     hour = start.hour
+    # Category/time-of-day bonuses
     if category == "focus":
         if 8 <= hour <= 13:
             score += 25
@@ -202,11 +326,13 @@ def _slot_fit_score(task: Dict, slot: Dict) -> int:
         if 10 <= hour <= 18:
             score += 10
 
+    # Energy-level adjustments
     if energy == "high" and hour >= 20:
         score -= 15
     if energy == "low" and 8 <= hour <= 11:
         score -= 5
 
+    # Earliest-start constraint
     earliest = task.get("earliest_start")
     if earliest:
         try:
@@ -219,6 +345,17 @@ def _slot_fit_score(task: Dict, slot: Dict) -> int:
 
 
 def best_slots_for_task(task: Dict, free_slots: List[Dict], limit: int = 3) -> List[Dict]:
+    """Return the best-fitting free slots for a single task, ranked by fit score.
+
+    Args:
+        task: A task dict (see ``_slot_fit_score`` for required keys).
+        free_slots: List of free slot dicts to evaluate.
+        limit: Maximum number of results (default 3).
+
+    Returns:
+        List[Dict]: The top ``limit`` slots, each augmented with a ``score``
+            field.
+    """
     ranked = []
     for slot in free_slots:
         score = _slot_fit_score(task, slot)
@@ -229,9 +366,23 @@ def best_slots_for_task(task: Dict, free_slots: List[Dict], limit: int = 3) -> L
 
 
 def build_task_plan(tasks: List[Dict], free_slots: List[Dict], limit: int = 6) -> List[Dict]:
-    """Greedy planner that assigns unscheduled tasks to appropriate free blocks.
-    Supports splittable tasks: if a task won't fit in one slot, it will be split
-    across multiple consecutive slots."""
+    """Greedily assign unscheduled tasks to the best-fitting free slots.
+
+    Tasks are sorted by deadline → priority → estimated duration. Each task is
+    assigned to its best available slot. If a task cannot fit in a single slot
+    and is tagged as splittable (or is >= 120 min), it is split across multiple
+    consecutive slots.
+
+    Args:
+        tasks: List of unscheduled task dicts.
+        free_slots: List of free slot dicts from ``get_free_slots()``.
+        limit: Maximum number of planned items to return (default 6).
+
+    Returns:
+        List[Dict]: Planned assignments, each with keys ``task``, ``start``,
+            ``end``, ``score``, and optionally ``chunk`` / ``total_chunks``
+            for split tasks.
+    """
     planned = []
     used = set()
 
@@ -242,11 +393,12 @@ def build_task_plan(tasks: List[Dict], free_slots: List[Dict], limit: int = 6) -
 
     for task in sorted(tasks, key=task_sort_key):
         task_minutes = _task_minutes(task)
+        # A task is splittable if explicitly tagged or if its duration >= 2 hours
         splittable = task.get("splittable", False) or (task_minutes >= 120)
         remaining = task_minutes
         chunks = []
 
-        # Try to find a single slot first
+        # First: try to fit the entire task in one slot
         candidates = best_slots_for_task(task, [s for i, s in enumerate(free_slots) if i not in used], limit=1)
         if candidates:
             slot = candidates[0]
@@ -265,7 +417,7 @@ def build_task_plan(tasks: List[Dict], free_slots: List[Dict], limit: int = 6) -
                     break
                 continue
 
-        # Task doesn't fit in one slot — try splitting if allowed
+        # Second: try splitting across multiple slots
         if splittable:
             available_slots = [s for i, s in enumerate(free_slots) if i not in used]
             available_slots.sort(key=lambda s: s["start"])
@@ -274,7 +426,7 @@ def build_task_plan(tasks: List[Dict], free_slots: List[Dict], limit: int = 6) -
                     break
                 chunk_duration = min(remaining, slot["duration_minutes"])
                 if chunk_duration < 30:
-                    continue  # skip slots too small even for a chunk
+                    continue  # Skip slots too small even for a chunk
                 original_idx = free_slots.index(next(s for s in free_slots if s["start"] == slot["start"] and s["end"] == slot["end"]))
                 used.add(original_idx)
                 chunks.append({
@@ -288,8 +440,8 @@ def build_task_plan(tasks: List[Dict], free_slots: List[Dict], limit: int = 6) -
                 if len(planned) + len(chunks) >= limit:
                     break
 
+            # Only add chunks if we were able to fit the entire task
             if chunks and remaining <= 0:
-                # Only add chunks if we fit the whole task
                 for ch in chunks:
                     ch["total_chunks"] = len(chunks)
                     planned.append(ch)
@@ -300,6 +452,15 @@ def build_task_plan(tasks: List[Dict], free_slots: List[Dict], limit: int = 6) -
 
 
 def format_task_plan(plan: List[Dict]) -> str:
+    """Format a task plan into a human-readable Telegram message.
+
+    Args:
+        plan: A list of planned assignments from ``build_task_plan()``.
+
+    Returns:
+        str: Newline-separated plan lines, e.g.
+            ``"1. Thu Jun 11, 2:00 PM - 4:00 PM: Finish report (120 min, due Fri Jun 19)"``.
+    """
     lines = []
     for i, item in enumerate(plan, start=1):
         task = item["task"]
@@ -317,8 +478,23 @@ def format_task_plan(plan: List[Dict]) -> str:
 
 # ── AI slot picker ────────────────────────────────────────────────────────────
 
+
 def suggest_slot(title: str, duration_minutes: int, free_slots: List[Dict]) -> Optional[Dict]:
-    """Ask Gemini to pick the best slot. Returns slot dict or None."""
+    """Use Gemini 2.5 Flash Lite to pick the best free slot from a list.
+
+    The LLM is prompted with the task title, required duration, and the first
+    8 available free slots. It is instructed to follow category/time-of-day
+    heuristics (e.g., study → morning, gym → morning or evening).
+
+    Args:
+        title: Task title.
+        duration_minutes: Required duration in minutes.
+        free_slots: List of free slot dicts.
+
+    Returns:
+        Optional[Dict]: The chosen slot dict, or ``None`` if the LLM call
+            fails or returns an invalid index.
+    """
     if not OPENROUTER_API_KEY or not free_slots:
         return None
 
@@ -362,6 +538,21 @@ def build_suggestion_message(
     duration_minutes: int,
     free_slots: List[Dict],
 ) -> Tuple[str, Optional[Dict]]:
+    """Build a Telegram message suggesting a free slot for a task.
+
+    Tries Gemini first via ``suggest_slot()``. If that fails or no free slots
+    exist, falls back to listing all available slots and asking the user to
+    pick.
+
+    Args:
+        title: Task title.
+        duration_minutes: Required duration.
+        free_slots: List of free slot dicts.
+
+    Returns:
+        Tuple[str, Optional[Dict]]: A (message_text, best_slot) pair. The slot
+            is ``None`` if no suggestion could be made.
+    """
     if not free_slots:
         return (
             f"📅 Scheduling: *{title}*\n\nYour calendar looks packed this week!\n"
@@ -395,10 +586,22 @@ def build_suggestion_message(
 
 # ── Weekly/daily AI recommendation engine ────────────────────────────────────
 
+
 def generate_weekly_plan(tasks: list, habits: list, free_slots: List[Dict]) -> str:
-    """
-    Generate a natural, intelligent weekly plan recommendation.
-    Called in Sunday planning message.
+    """Generate a short, intelligent weekly plan recommendation via Gemini.
+
+    Called in the Sunday planning message. The LLM receives the list of tasks
+    due next week, weekly habits, and free slots, and returns a bullet-point
+    plan assigning each item to specific time slots.
+
+    Args:
+        tasks: List of task dicts with ``title``, ``deadline``, ``priority``.
+        habits: List of habit dicts with ``title``, ``frequency``, ``count``.
+        free_slots: List of free slot dicts.
+
+    Returns:
+        str: The AI-generated plan text, or an empty string if the API key is
+            not configured or the call fails.
     """
     if not OPENROUTER_API_KEY:
         return ""
@@ -456,8 +659,22 @@ def generate_daily_recommendations(
     habits:        list,
     free_slots:    List[Dict],
 ) -> str:
-    """
-    Generate morning briefing recommendations — what to do with free time today.
+    """Generate a morning briefing recommendation for fitting unscheduled items
+    into today's gaps.
+
+    Called in the morning briefing job. The LLM receives today's calendar
+    events, free gaps, unscheduled tasks, and daily habits, and suggests a
+    schedule.
+
+    Args:
+        todays_events: List of Google Calendar event dicts for today.
+        todays_tasks: List of task dicts due today.
+        unscheduled: List of unscheduled task dicts.
+        habits: List of daily habit dicts.
+        free_slots: List of today's free slot dicts.
+
+    Returns:
+        str: AI-generated recommendation text, or empty string on failure.
     """
     if not OPENROUTER_API_KEY or (not unscheduled and not habits):
         return ""
@@ -508,11 +725,20 @@ def generate_daily_recommendations(
 
 # ── Weekly review ─────────────────────────────────────────────────────────────
 
+
 def generate_weekly_review(completed: list, planned: list) -> str:
-    """
-    Generate a short weekly review using Gemini.
-    completed: tasks marked done this week
-    planned: all tasks that had deadlines this week
+    """Generate a short, encouraging weekly review using Gemini.
+
+    Called by the Sunday weekly review job. The LLM receives the list of
+    completed and missed tasks, computes a completion rate, and returns a
+    motivational summary.
+
+    Args:
+        completed: Tasks marked 'done' this week.
+        planned: All tasks that had deadlines this week.
+
+    Returns:
+        str: AI-generated review text, or empty string on failure.
     """
     if not OPENROUTER_API_KEY:
         return ""

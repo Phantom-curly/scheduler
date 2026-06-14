@@ -1,10 +1,70 @@
-python-telegram-bot==21.5
-python-dotenv==1.0.1
-dateparser==1.2.0
-google-api-python-client==2.127.0
-google-auth-httplib2==0.2.0
-google-auth-oauthlib==1.2.0
-APScheduler==3.10.4
-pytz==2024.1
-python-dateutil==2.9.0.post0
-requests
+# =============================================================================
+# Planning Bot — Python Dependencies
+# =============================================================================
+# Install:  pip install -r requirements.txt
+# Freeze:   pip freeze > requirements.txt  (after testing with your Python version)
+#
+# Pinning strategy:
+#   - Core dependencies use `>=` minimums so pip resolves compatible newer
+#     versions automatically.
+#   - Transitive dependencies that must match specific Google client versions
+#     are pinned with `==` to prevent silent breakage.
+# =============================================================================
+
+# ── Telegram Bot API ──────────────────────────────────────────────────────────
+# Async wrapper for the Telegram Bot API v20+.  Handles long polling, message
+# routing, inline keyboards, and callback queries.
+python-telegram-bot>=20.0
+
+# ── Google Calendar API ──────────────────────────────────────────────────────
+# Official Google Calendar v3 API client.  Used by calendar_client.py for
+# CRUD, recurring events, and custom reminders.
+google-api-python-client>=2.100.0
+
+# HTTP transport library required by google-api-python-client and the OAuth
+# flow.  Pinned to match the 2.x line that ships with the Google client.
+google-auth-httplib2>=0.1.0
+
+# OAuth 2.0 consent flow — used by both auth_calendar.py (first-time setup)
+# and calendar_client.py (automatic token refresh).
+google-auth-oauthlib>=1.0.0
+
+# Core Google authentication library.  Required by all three google-* packages
+# above.
+google-auth>=2.20.0
+
+# ── Scheduling (background jobs) ─────────────────────────────────────────────
+# Async cron-like job scheduler.  Runs 9 automated jobs: morning briefing,
+# midday urgency check, evening planning, weekly review, weekly planning,
+# calendar reminders (1 min), app reminders (1 min), overdue lifecycle
+# (daily), stale event cleanup (1 hr).
+APScheduler>=3.10.0
+
+# ── Natural Language Processing ──────────────────────────────────────────────
+# Flexible date/time extraction from natural language.  Configured with
+# PREFER_DATES_FROM="future" to avoid past-date misinterpretation.
+dateparser>=1.2.0
+
+# Timezone-aware datetime handling.  All datetime operations reference the
+# TIMEZONE environment variable (default "Asia/Seoul").
+pytz>=2023.3
+
+# Companion library used internally by dateparser for recurrence and delta
+# calculations.
+python-dateutil>=2.8.0
+
+# ── LLM Gateway (OpenRouter / Gemini) ────────────────────────────────────────
+# HTTP client for OpenRouter API calls.  Used by llm.py (intent parsing) and
+# smart_schedule.py (AI slot suggestions, weekly plans, daily recommendations,
+# weekly reviews).
+requests>=2.31.0
+
+# ── Configuration ────────────────────────────────────────────────────────────
+# Loads environment variables from a .env file at startup.  Used by config.py
+# to export TELEGRAM_TOKEN, ALLOWED_USER_ID, TIMEZONE, etc.
+python-dotenv>=1.0.0
+
+# =============================================================================
+# Stdlib modules used (no pip install needed):
+#   asyncio, datetime, json, logging, os, re, sqlite3, typing
+# =============================================================================

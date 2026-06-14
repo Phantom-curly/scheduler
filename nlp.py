@@ -1,5 +1,41 @@
+# Copyright (c) 2026 Planning Bot Contributors
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """
-NLP helpers — intent detection, datetime/duration/reminder/recurrence extraction.
+Natural language processing — regex-based intent detection, datetime extraction,
+and message parsing for the Planning Bot.
+
+This module provides the primary parsing path for user messages. It uses
+regex-based pattern matching to detect 18 intent types, then extracts structured
+data (title, datetime, duration, recurrence, category, energy) from the raw text.
+An optional LLM path (in ``llm.py``) serves as a secondary, more flexible parser
+when the regex engine is uncertain.
+
+Key capabilities:
+    - Intent detection via 18 ordered regex patterns (most specific first).
+    - Datetime extraction with 8 fallback strategies, deadline-context awareness.
+    - Duration extraction (including "from X to Y" range calculation).
+    - Recurrence extraction (RRULE generation) and reminder-minute parsing.
+    - Category, energy-level, and splittability inference.
+    - Habit count and notes extraction.
+    - Multi-slot ("every Monday and Friday") detection.
 """
 
 import os
@@ -14,6 +50,11 @@ from typing import Optional, Dict, Any, List
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Seoul")
 
 # ── Intent patterns (order matters — more specific first) ──────────────────────
+#
+# Patterns are ordered from most specific to least specific within each intent
+# group and across groups. For example, ``habit_delete`` must be checked before
+# the broader ``delete`` pattern, and ``schedule_direct`` before ``schedule``,
+# to avoid false-positive matches on shared keywords like "schedule" or "delete".
 
 _INTENTS = {
     "habit_delete": [
@@ -53,6 +94,10 @@ _INTENTS = {
         r"\b(find|show|give)\b.{0,30}\b(free|available|open)\b.{0,20}\b(time|slot|block)s?\b",
         r"\bfind\s+me\b.{0,20}\b\d+(?:\.\d+)?\s*(?:hours?|hrs?|minutes?|mins?)\b",
         r"\b(can i fit|fit in)\b",
+    ],
+    "reminder_list": [
+        r"\b(list|show|view|my)\b.{0,20}\b(reminders?|alerts?|notifications)\b",
+        r"^\s*reminders?\s*$",
     ],
     "reminder": [
         r"\bremind\s+me\b",
@@ -182,7 +227,23 @@ _STRIP_COUNT_RE = re.compile(
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
+
 def detect_intent(text: str) -> str:
+    """Detect the user's intent from natural language text.
+
+    Iterates through the ``_INTENTS`` dictionary in definition order (most
+    specific patterns first). The first matching intent is returned. If no
+    pattern matches, falls back to checking for deadline hints
+    (``by``/``due``/``deadline``) or a parseable date, and returns ``"add"``
+    or ``"unknown"``.
+
+    Args:
+        text: Raw user message.
+
+    Returns:
+        str: One of the 18 intent keys (``"add"``, ``"list"``, ``"schedule"``,
+            etc.) or ``"unknown"``.
+    """
     t = text.lower().strip()
     for intent, patterns in _INTENTS.items():
         for pat in patterns:
@@ -213,6 +274,17 @@ _NEXT_WEEK_DAY_RE = re.compile(
 
 
 def _next_weekday(name: str, force_next: bool = False, add_weeks: int = 0) -> datetime:
+    """Return the next occurrence of a weekday name as a timezone-aware datetime.
+
+    Args:
+        name: Day name (e.g. ``"monday"``, ``"tue"``).
+        force_next: If ``True``, always returns *next* week's occurrence even
+            if today is that day. If ``False``, returns today if it matches.
+        add_weeks: Additional weeks to add (used for "next week Monday").
+
+    Returns:
+        datetime: The target datetime at 09:00 (morning default).
+    """
     tz         = pytz.timezone(TIMEZONE)
     today      = datetime.now(tz)
     target     = _DAYS[name.lower()]
@@ -223,51 +295,71 @@ def _next_weekday(name: str, force_next: bool = False, add_weeks: int = 0) -> da
 
 
 def _default_morning(dt: datetime) -> datetime:
-    """If dt has no meaningful time component (midnight), default to 9 AM."""
+    """If *dt* has no meaningful time component (midnight), default to 9 AM.
+
+    Args:
+        dt: A datetime to adjust.
+
+    Returns:
+        datetime: The same datetime, or set to 09:00 if it was midnight.
+    """
     if dt.hour == 0 and dt.minute == 0:
         return dt.replace(hour=9, minute=0, second=0, microsecond=0)
     return dt
 
 
 def _parse_date_phrase(phrase: str) -> Optional[datetime]:
+    """Parse a date phrase like ``"next monday"``, ``"tomorrow"``, or
+    ``"next week friday"`` into a timezone-aware datetime.
+
+    This is the core helper for the datetime extraction pipeline. It handles
+    relative day names, "next/this" modifiers, and falls back to
+    ``dateparser.parse()`` for arbitrary date strings.
+
+    Args:
+        phrase: A date phrase (e.g. ``"next monday"``, ``"tomorrow"``).
+
+    Returns:
+        Optional[datetime]: A timezone-aware datetime, or ``None`` if parsing
+            fails.
+    """
     phrase = phrase.strip()
     tz     = pytz.timezone(TIMEZONE)
-    
+
     # "next week monday", "this week friday"
     m = _NEXT_WEEK_DAY_RE.match(phrase)
     if m:
         add = 1 if phrase.lower().startswith("next") else 0
         return _default_morning(_next_weekday(m.group(1), force_next=True, add_weeks=add))
-    
+
     # "next monday", "this monday"
     m = _NEXT_RE.match(phrase)
     if m and m.group(1).lower() in _DAYS:
         return _default_morning(_next_weekday(m.group(1), force_next=True))
-    
+
     m = _THIS_RE.match(phrase)
     if m and m.group(1).lower() in _DAYS:
         return _default_morning(_next_weekday(m.group(1), force_next=False))
-    
+
     # Bare day name
     m = _PLAIN_RE.match(phrase)
     if m:
         return _default_morning(_next_weekday(m.group(1)))
-    
+
     # "tomorrow" → tomorrow at 9 AM
     if phrase.lower() == "tomorrow":
         now = datetime.now(tz)
         return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-    
+
     if phrase.lower() in ("today", "tonight"):
         return datetime.now(tz)
-    
+
     return dateparser.parse(phrase, settings={"PREFER_DATES_FROM": "future", "PREFER_DAY_OF_MONTH": "first"})
 
 
 # ── Time-of-day words ─────────────────────────────────────────────────────────
 
 # Mapping of time-of-day words to hour (minutes = 0).
-# Ordered chronologically for reference.
 _TIMES_OF_DAY = {
     "midnight": 0,
     "dawn":     5,
@@ -286,7 +378,6 @@ _DEADLINE_MARKERS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Detect if the text is in a deadline context (by/due/before/until)
 _IS_DEADLINE_CONTEXT_RE = re.compile(
     r"\b(by|due|deadline|before|until)\b",
     re.IGNORECASE,
@@ -303,43 +394,46 @@ _TIMES_OF_DAY_RE = re.compile(
 
 
 def resolve_time_of_day(text: str, now: Optional[datetime] = None) -> Optional[datetime]:
-    """
-    Resolve a time-of-day word to the *closest future* datetime.
-    
-    If the time-of-day today is still in the future, return today at that hour.
-    If it has already passed, return *tomorrow* at that hour.
-    
+    """Resolve a time-of-day word to the *closest future* datetime.
+
+    If the time-of-day today is still in the future, returns today at that hour.
+    If it has already passed, returns *tomorrow* at that hour.
+
     Examples (now=10:00 AM):
-      "at lunch"    → today 12:00 PM
-      "in the evening" → today 8:00 PM
-      "morning"     → today 8:00 AM (past!) → tomorrow 8:00 AM
-    
-    Examples (now=2:00 PM):
-      "morning"     → tomorrow 8:00 AM
-      "evening"     → today 8:00 PM
+        ``"at lunch"`` → today 12:00 PM
+        ``"in the evening"`` → today 8:00 PM
+        ``"morning"`` → today 8:00 AM (past!) → tomorrow 8:00 AM
+
+    Args:
+        text: Input text containing a time-of-day keyword.
+        now: Reference datetime (defaults to current time in configured timezone).
+
+    Returns:
+        Optional[datetime]: The resolved datetime, or ``None`` if no time-of-day
+            word is found.
     """
     if now is None:
         now = datetime.now(pytz.timezone(TIMEZONE))
-    
+
     m = _TIMES_OF_DAY_RE.search(text)
     if not m:
         return None
-    
+
     word = m.group(1).lower()
     if word not in _TIMES_OF_DAY:
         return None
-    
+
     hour = _TIMES_OF_DAY[word]
     candidate = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-    
+
     # If candidate is in the past, push to next occurrence (tomorrow)
     if candidate <= now:
         candidate += timedelta(days=1)
-    
+
     return candidate
 
 
-# ── FIXME: "day of month" parsing ─────────────────────────────────────────────
+# ── "day of month" parsing ────────────────────────────────────────────────────
 
 _NTH_OF_MONTH_RE = re.compile(
     r"(\d+)(?:st|nd|rd|th)\s+of\s+(?:(?:this|the\s+next|next)\s+)?month",
@@ -348,17 +442,25 @@ _NTH_OF_MONTH_RE = re.compile(
 
 
 def resolve_nth_of_month(text: str, now: Optional[datetime] = None) -> Optional[datetime]:
-    """Resolve patterns like '17th of next month' or '3rd of this month'."""
+    """Resolve patterns like ``"17th of next month"`` or ``"3rd of this month"``.
+
+    Args:
+        text: Input text containing an nth-of-month pattern.
+        now: Reference datetime (defaults to current time in configured timezone).
+
+    Returns:
+        Optional[datetime]: The resolved datetime at 09:00, or ``None``.
+    """
     if now is None:
         now = datetime.now(pytz.timezone(TIMEZONE))
-    
+
     m = _NTH_OF_MONTH_RE.search(text)
     if not m:
         return None
-    
+
     day = int(m.group(1))
     phrase = m.group(0).lower()
-    
+
     if "next" in phrase:
         target_month = now.month + 1
         target_year = now.year
@@ -368,18 +470,18 @@ def resolve_nth_of_month(text: str, now: Optional[datetime] = None) -> Optional[
     else:
         target_month = now.month
         target_year = now.year
-    
+
     # Clamp day to valid range for the target month
     import calendar
     max_day = calendar.monthrange(target_year, target_month)[1]
     day = min(day, max_day)
-    
+
     return now.replace(year=target_year, month=target_month, day=day, hour=9, minute=0, second=0, microsecond=0)
 
 
 # ── Regex patterns for extract_datetime ────────────────────────────────────────
 
-# Day+time together (for reminders): "tomorrow 4pm", "Monday 9am", "monday evening", "tomorrow morning"
+# Day+time together (for reminders): "tomorrow 4pm", "Monday 9am"
 _DAY_WITH_TIME_RE = re.compile(
     r"((?:next\s+|this\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today)"
     r"\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b"
@@ -407,7 +509,7 @@ _RELATIVE_DAY_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Named relative days: "day after tomorrow", "day before yesterday", "after tomorrow", "before yesterday"
+# Named relative days: "day after tomorrow", "day before yesterday"
 _NAMED_RELATIVE_DAY_RE = re.compile(
     r"\b(the\s+)?(day\s+after\s+tomorrow|day\s+before\s+yesterday|after\s+tomorrow|before\s+yesterday)\b",
     re.IGNORECASE,
@@ -449,63 +551,90 @@ _BARE_DATE_RE = re.compile(
 
 
 def _slot_has_time(slot_str: str) -> bool:
-    """Check if a slot string contains an hour reference (e.g. '9 pm', '3:30')."""
+    """Check if a slot string contains an hour reference.
+
+    Args:
+        slot_str: A day+time string (e.g. ``"monday 9pm"``, ``"friday"``).
+
+    Returns:
+        bool: ``True`` if the string includes a numeric time component.
+    """
     return bool(re.search(r"\d{1,2}(?::\d{2})?\s*(?:am|pm|\d{1,2})", slot_str, re.IGNORECASE))
 
 
 def _is_deadline_context(text: str) -> bool:
-    """Check if the text is in a deadline context (by/due/before/until)."""
+    """Check whether the text is in a deadline context (by/due/before/until).
+
+    When true, bare day names resolve to 23:59 (end of day) instead of 09:00
+    (morning default). Also, ``"midnight"`` resolves to 23:59 (end of today).
+
+    Args:
+        text: Input text.
+
+    Returns:
+        bool: ``True`` if deadline markers are present.
+    """
     return bool(_IS_DEADLINE_CONTEXT_RE.search(text))
 
 
 def _end_of_day(dt: datetime) -> datetime:
-    """Set the time to 23:59 (end of day)."""
+    """Set the time of *dt* to 23:59 (end of day).
+
+    Args:
+        dt: A datetime (midnight or any time).
+
+    Returns:
+        datetime: Same date, but at 23:59.
+    """
     return dt.replace(hour=23, minute=59, second=0, microsecond=0)
 
 
 def extract_datetime(text: str) -> Optional[datetime]:
-    """
-    Robust datetime extraction with multiple fallback strategies.
-    
+    """Robust datetime extraction with multiple fallback strategies.
+
     Priority order:
-      0.  Day + explicit time together (e.g. "Monday 9am", "tomorrow 4pm")
-      0a. Day + time-of-day together (e.g. "monday evening", "tomorrow morning")
-      0b. Relative time (e.g. "in 2 hours", "in 30 minutes")
-      0c. Time-of-day word alone (e.g. "at lunch", "in the evening", "morning")
-      0d. Relative days (e.g. "in 3 days", "in 2 weeks")
-      0e. Named relative days (e.g. "day after tomorrow", "day before yesterday")
-      0f. "Nth of month" (e.g. "17th of next month", "3rd of this month")
-      0g. Bare time (e.g. "at 9 pm", "at 3:30am") → defaults to today
-      1.  Explicit markers (by/due/before/until/for + date)
-      2.  "on [weekday]"
-      3.  Bare day/date references
-      4.  Full text fallback via dateparser
-    
-    Deadline context (by/due/before/until):
-      - "midnight" → 23:59 (end of day)
-      - "in 2 days" → date at 23:59 (end of day)
-      - Bare day name → day at 23:59 (end of day)
+        0.  Day + explicit time together (e.g. ``"Monday 9am"``, ``"tomorrow 4pm"``)
+        0a. Day + time-of-day together (e.g. ``"monday evening"``, ``"tomorrow morning"``)
+        0b. Relative time (e.g. ``"in 2 hours"``, ``"in 30 minutes"``)
+        0c. Time-of-day word alone (e.g. ``"at lunch"``, ``"in the evening"``)
+        0d. Relative days (e.g. ``"in 3 days"``, ``"in 2 weeks"``)
+        0e. Named relative days (e.g. ``"day after tomorrow"``)
+        0f. Nth-of-month (e.g. ``"17th of next month"``)
+        0g. Bare time (e.g. ``"at 9 pm"``) → defaults to today
+        1.  Explicit markers (by/due/before/until + date)
+        2.  ``"on [weekday]"``
+        3.  Bare day/date references
+        4.  Full text fallback via ``dateparser.parse()``
+
+    Deadline context (``by``/``due``/``before``/``until``):
+        - ``"midnight"`` → 23:59 (end of day)
+        - ``"in 2 days"`` → date at 23:59
+        - Bare day name → day at 23:59
+
+    Args:
+        text: Raw user text.
+
+    Returns:
+        Optional[datetime]: A timezone-aware datetime, or ``None`` if all
+            strategies fail.
     """
     # Normalize period-as-separator in times: "2.11 am" → "2:11 am"
     text = re.sub(r"(\d)\.(\d{2})\s*(am|pm)", r"\1:\2 \3", text, flags=re.IGNORECASE)
-    
+
     is_deadline = _is_deadline_context(text)
-    
+
     # ─── Step 0: Day + explicit time ────────────────────────────────────────
-    # e.g. "Monday 9am", "tomorrow 4pm", "monday evening", "tomorrow morning"
     m = _DAY_WITH_TIME_RE.search(text)
     if m:
         group = m.group(1)
-        # Check if it's a day + time-of-day (e.g. "monday evening")
         if re.search(r"(dawn|morning|lunch|noon|afternoon|dusk|evening|night|midnight)", group, re.IGNORECASE):
-            # Extract the day and the time-of-day separately
+            # Day + time-of-day word (e.g. "monday evening")
             day_match = re.search(
                 r"(?:next\s+|this\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|today)",
                 group, re.IGNORECASE
             )
             tod_match = _TIMES_OF_DAY_RE.search(group)
             if day_match and tod_match:
-                # Get the date from the day name
                 day_dt = _parse_date_phrase(day_match.group(1))
                 if day_dt:
                     word = tod_match.group(1).lower()
@@ -516,8 +645,7 @@ def extract_datetime(text: str) -> Optional[datetime]:
                     if hour is not None:
                         return day_dt.replace(hour=hour, minute=0, second=0, microsecond=0)
         else:
-            # Parse day and explicit time separately using timezone-aware functions.
-            # dateparser doesn't know KST, so "today at 2:37 am" gets the wrong UTC day.
+            # Day + explicit numeric time (e.g. "Monday 9am")
             day_time_match = re.match(
                 r"((?:next\s+|this\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun|tomorrow|today))"
                 r"\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm))",
@@ -532,40 +660,34 @@ def extract_datetime(text: str) -> Optional[datetime]:
             dt = dateparser.parse(group, settings={"PREFER_DATES_FROM": "future"})
             if dt:
                 return dt
-    
+
     # ─── Step 0b: Relative time (hours/minutes) ─────────────────────────────
-    # e.g. "in 2 hours", "in 30 minutes"
     m = _RELATIVE_TIME_RE.search(text)
     if m:
         amount = int(m.group(1))
         unit   = m.group(2).lower()
         delta  = timedelta(hours=amount) if "h" in unit else timedelta(minutes=amount)
         return datetime.now(pytz.timezone(TIMEZONE)) + delta
-    
+
     # ─── Step 0c: Time-of-day word alone ────────────────────────────────────
-    # e.g. "at lunch", "in the evening", "morning"
     tod_dt = resolve_time_of_day(text)
     if tod_dt:
-        # In deadline context, "midnight" alone → today at 23:59
         if is_deadline and "midnight" in text.lower():
             return _end_of_day(tod_dt)
         return tod_dt
-    
+
     # ─── Step 0d: Relative days ─────────────────────────────────────────────
-    # e.g. "in 3 days", "in 2 weeks"
     m = _RELATIVE_DAY_RE.search(text)
     if m:
         amount = int(m.group(1))
         unit   = m.group(2).lower()
         delta  = timedelta(weeks=amount) if "week" in unit else timedelta(days=amount)
         result = datetime.now(pytz.timezone(TIMEZONE)) + delta
-        # In deadline context, "in 2 days" means end of that day (23:59)
         if is_deadline:
             return _end_of_day(result)
         return _default_morning(result)
-    
+
     # ─── Step 0e: Named relative days ───────────────────────────────────────
-    # e.g. "day after tomorrow", "day before yesterday", "after tomorrow"
     m = _NAMED_RELATIVE_DAY_RE.search(text)
     if m:
         phrase = m.group(2).lower()
@@ -577,35 +699,31 @@ def extract_datetime(text: str) -> Optional[datetime]:
         if "before yesterday" in phrase:
             return _default_morning(datetime.now(pytz.timezone(TIMEZONE)) - timedelta(days=2))
         return None
-    
+
     # ─── Step 0f: Nth of month ──────────────────────────────────────────────
-    # e.g. "17th of next month", "3rd of this month"
     nth_dt = resolve_nth_of_month(text)
     if nth_dt:
         if is_deadline:
             return _end_of_day(nth_dt)
         return nth_dt
-    
+
     # ─── Step 0g: Bare time ─────────────────────────────────────────────────
-    # e.g. "at 9 pm", "at 3:30am" → defaults to today
     m = _BARE_TIME_RE.search(text)
     if m:
         dt = dateparser.parse(m.group(1), settings={"PREFER_DATES_FROM": "future"})
         if dt:
             now = datetime.now(pytz.timezone(TIMEZONE))
             return now.replace(hour=dt.hour, minute=dt.minute, second=0, microsecond=0)
-    
-    # ─── Step 1: Explicit markers ───────────────────────────────────────────
-    # e.g. "by monday", "due friday", "for tomorrow"
+
+    # ─── Step 1: Explicit markers ─────────────────────────────────────────────
     m = _DATE_MARKER_RE.search(text)
     if m:
         dt = _parse_date_phrase(m.group(1))
         if dt:
-            # In deadline context, bare day name → end of day (23:59)
             if is_deadline:
                 return _end_of_day(dt)
             return dt
-    
+
     # ─── Step 2: "on [weekday]" ─────────────────────────────────────────────
     m = _ON_DAY_RE.search(text)
     if m:
@@ -614,7 +732,7 @@ def extract_datetime(text: str) -> Optional[datetime]:
             if is_deadline:
                 return _end_of_day(dt)
             return dt
-    
+
     # ─── Step 3: Bare day/date references ───────────────────────────────────
     m = _BARE_DATE_RE.search(text)
     if m:
@@ -623,26 +741,40 @@ def extract_datetime(text: str) -> Optional[datetime]:
             if is_deadline:
                 return _end_of_day(dt)
             return dt
-    
+
     # ─── Step 4: Full text fallback ─────────────────────────────────────────
     return dateparser.parse(text, settings={"PREFER_DATES_FROM": "future", "PREFER_DAY_OF_MONTH": "first"})
 
 
 def extract_duration(text: str) -> Optional[int]:
+    """Extract a duration in minutes from natural language text.
+
+    Supports these patterns (in priority order):
+        1. ``"from X to Y"`` — computes the difference between start and end times.
+        2. ``"both N hours"`` — for tasks with two equal-duration slots.
+        3. ``"for N hours"`` / ``"for N minutes"``.
+        4. ``"takes N hours"`` / ``"needs N hours"`` (effort estimate).
+        5. Bare ``"N hours"`` / ``"N minutes"``.
+
+    Args:
+        text: Raw user text.
+
+    Returns:
+        Optional[int]: Duration in minutes, or ``None`` if no pattern matches.
+    """
     # First: try "from X to Y" — compute the difference between start and end times
     m = _FROM_TO_DURATION_RE.search(text)
     if m:
         try:
             start_str = m.group(1).strip()
             end_str   = m.group(2).strip()
-            # Parse both times, assume today
             start_dt = dateparser.parse(start_str, settings={"PREFER_DATES_FROM": "future"})
             end_dt   = dateparser.parse(end_str,   settings={"PREFER_DATES_FROM": "future"})
             if start_dt and end_dt:
                 now = datetime.now(pytz.timezone(TIMEZONE))
                 start = now.replace(hour=start_dt.hour, minute=start_dt.minute, second=0, microsecond=0)
                 end   = now.replace(hour=end_dt.hour, minute=end_dt.minute, second=0, microsecond=0)
-                # If end is before start, assume it crosses midnight (e.g. 9pm to 11pm won't, but 10pm to 2am would)
+                # If end is before start, it crosses midnight (e.g. 10pm to 2am)
                 if end <= start:
                     end += timedelta(days=1)
                 diff = int((end - start).total_seconds() / 60)
@@ -660,6 +792,17 @@ def extract_duration(text: str) -> Optional[int]:
 
 
 def extract_reminder_minutes(text: str) -> int:
+    """Extract a relative reminder lead time in minutes.
+
+    Matches patterns like ``"remind me 45 min before"``. Falls back to 30
+    minutes if no explicit reminder time is found.
+
+    Args:
+        text: Raw user text.
+
+    Returns:
+        int: Minutes before the event to trigger the reminder (default 30).
+    """
     m = _REMINDER_RE.search(text)
     if m:
         amount = int(m.group(1))
@@ -669,13 +812,22 @@ def extract_reminder_minutes(text: str) -> int:
 
 
 def compute_reminder_minutes(text: str, event_start_dt: Optional[datetime] = None) -> int:
-    """
-    Compute reminder minutes before event, supporting both relative and absolute times.
+    """Compute reminder minutes before event, supporting both relative and
+    absolute times.
 
     Priority:
-    1. Absolute reminder time: "remind me at 2:30 PM" + event_start → minutes_before
-    2. Relative reminder: "remind me 45 min before" → 45
-    3. Default: 30 min before
+        1. Absolute reminder time: ``"remind me at 2:30 PM"`` + ``event_start``
+           → computes ``minutes_before``.
+        2. Relative reminder: ``"remind me 45 min before"`` → 45.
+        3. Default: 30 min before.
+
+    Args:
+        text: Raw user text.
+        event_start_dt: The event's start datetime (required for absolute time
+            calculation).
+
+    Returns:
+        int: Minutes before the event.
     """
     # Try absolute time first
     if event_start_dt:
@@ -692,7 +844,6 @@ def compute_reminder_minutes(text: str, event_start_dt: Optional[datetime] = Non
                         }
                     )
                     if reminder_dt:
-                        # Parse out just the time
                         abs_time = event_start_dt.replace(
                             hour=reminder_dt.hour,
                             minute=reminder_dt.minute,
@@ -709,8 +860,18 @@ def compute_reminder_minutes(text: str, event_start_dt: Optional[datetime] = Non
 
 
 def extract_habit_count(text: str) -> int:
-    """Extract repetition count — e.g. '4 times', '2 sessions', '3x', 'twice', 'thrice'."""
-    # Word forms
+    """Extract repetition count from a habit description.
+
+    Supports word forms (``"once"``, ``"twice"``, ``"thrice"``) and numeric
+    forms (``"4 times"``, ``"2 sessions"``, ``"3x"``, ``"2-3 times"``). For
+    ranges, the upper bound is returned.
+
+    Args:
+        text: Habit description text.
+
+    Returns:
+        int: Repetition count (default 1).
+    """
     word_counts = {
         "once": 1, "twice": 2, "thrice": 3,
         "double": 2, "triple": 3,
@@ -718,7 +879,7 @@ def extract_habit_count(text: str) -> int:
     for word, count in word_counts.items():
         if re.search(rf"\b{word}\b", text, re.IGNORECASE):
             return count
-    # Numeric forms: "4 times", "2 sessions", "3x", "2-3 times", etc.
+    # Numeric forms: "4 times", "2 sessions", "3x", "2-3 times"
     m = re.search(r"(\d+)\s*(?:-|to|–)\s*(\d+)", text, re.IGNORECASE)
     if m:
         return int(m.group(2))  # take the upper bound
@@ -727,9 +888,16 @@ def extract_habit_count(text: str) -> int:
 
 
 def extract_habit_notes(text: str) -> Optional[str]:
-    """
-    Extract a short descriptor — e.g. '30 min', '×2', '5km'.
-    Looks for patterns like '30 min', '1 hour', '5 km', 'x2'.
+    """Extract a short descriptor from a habit description.
+
+    Looks for patterns like ``"30 min"``, ``"1 hour"``, ``"5 km"``, or
+    ``"x2"`` appended to the habit name.
+
+    Args:
+        text: Habit description text.
+
+    Returns:
+        Optional[str]: The matched descriptor, or ``None``.
     """
     patterns = [
         r"\b(\d+(?:\.\d+)?)\s*(min(?:utes?)?|hour[s]?|hr[s]?|km|miles?)\b",
@@ -743,6 +911,18 @@ def extract_habit_notes(text: str) -> Optional[str]:
 
 
 def infer_category(text: str) -> str:
+    """Infer a task's category from its title text.
+
+    Uses keyword matching to classify into one of:
+        ``"fitness"``, ``"focus"``, ``"meeting"``, ``"errand"``, ``"home"``,
+        or ``"general"``.
+
+    Args:
+        text: Task title.
+
+    Returns:
+        str: The inferred category.
+    """
     t = text.lower()
     if re.search(r"\b(gym|run|running|workout|exercise|sport|swim|yoga)\b", t):
         return "fitness"
@@ -758,6 +938,20 @@ def infer_category(text: str) -> str:
 
 
 def infer_energy(text: str, category: str = None) -> str:
+    """Infer the energy level required for a task.
+
+    High-energy keywords (``"exam"``, ``"urgent"``, etc.) return ``"high"``.
+    Otherwise, the category determines the level: focus/fitness → high,
+    errand/home → low, default → medium.
+
+    Args:
+        text: Task title.
+        category: Pre-inferred category (will call ``infer_category`` if
+            ``None``).
+
+    Returns:
+        str: ``"low"``, ``"medium"``, or ``"high"``.
+    """
     t = text.lower()
     category = category or infer_category(text)
     if re.search(r"\b(deep|hard|intense|exam|midterm|final|urgent|important)\b", t):
@@ -770,6 +964,20 @@ def infer_energy(text: str, category: str = None) -> str:
 
 
 def infer_splittable(text: str, duration: int, category: str = None) -> bool:
+    """Infer whether a task can be split across multiple calendar blocks.
+
+    A task is considered splittable if it explicitly mentions splitting, or if
+    its duration is >= 120 minutes and its category allows it (fitness, meeting,
+    and errand tasks are never split).
+
+    Args:
+        text: Task title.
+        duration: Estimated duration in minutes.
+        category: Pre-inferred category.
+
+    Returns:
+        bool: ``True`` if the task can be split.
+    """
     t = text.lower()
     category = category or infer_category(text)
     if re.search(r"\b(split|chunk|over several|over multiple)\b", t):
@@ -788,24 +996,51 @@ _UNTIL_RE = re.compile(
 
 
 def _parse_until(text: str) -> Optional[str]:
-    """Extract UNTIL date from recurrence text and return it as an ICS-formatted string."""
+    """Extract an UNTIL date from recurrence text and return it as an
+    ICS-formatted string (``YYYYMMDDTHHMMSSZ``).
+
+    Args:
+        text: Raw user text containing "until <date>".
+
+    Returns:
+        Optional[str]: ICS-formatted datetime string in UTC, or ``None``.
+    """
     m = _UNTIL_RE.search(text)
     if not m:
         return None
     dt = extract_datetime(m.group(1))
     if dt:
-        # ICS format: YYYYMMDDTHHMMSSZ
         return dt.astimezone(pytz.utc).strftime("%Y%m%dT%H%M%SZ")
     return None
 
 
 def extract_recurrence(text: str) -> Optional[Dict]:
+    """Extract a recurrence rule from natural language.
+
+    Supports patterns like:
+        - ``"every day"`` → ``RRULE:FREQ=DAILY``
+        - ``"every weekday"`` → ``RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR``
+        - ``"every weekend"`` → ``RRULE:FREQ=WEEKLY;BYDAY=SA,SU``
+        - ``"every week"`` → ``RRULE:FREQ=WEEKLY``
+        - ``"every month"`` → ``RRULE:FREQ=MONTHLY``
+        - ``"every last day of month"`` → ``RRULE:FREQ=MONTHLY;BYMONTHDAY=-1``
+        - ``"every 17th of the month"`` → ``RRULE:FREQ=MONTHLY;BYMONTHDAY=17``
+        - ``"every monday and friday"`` → ``RRULE:FREQ=WEEKLY;BYDAY=MO,FR``
+        - ``"every day until May 5"`` → ``RRULE:FREQ=DAILY;UNTIL=...``
+
+    Args:
+        text: Raw user text.
+
+    Returns:
+        Optional[Dict]: A dict with keys ``rrule`` (the RRULE string) and
+            ``summary`` (a human-readable description), or ``None`` if no
+            recurrence pattern is found.
+    """
     m = _RECURRENCE_RE.search(text)
     if not m:
         return None
     period = m.group(1).lower().strip()
 
-    # Build base rrule
     if period == "day":
         base = "RRULE:FREQ=DAILY"
         summary = "every day"
@@ -823,14 +1058,14 @@ def extract_recurrence(text: str) -> Optional[Dict]:
         base = "RRULE:FREQ=MONTHLY;BYMONTHDAY=-1"
         summary = "every last day of month"
     else:
-        # Check for "Nth of month"
+        # "Nth of month"
         nth = re.match(r"(\d+)", period)
         if nth and "of" in period:
             d = nth.group(1)
             base = f"RRULE:FREQ=MONTHLY;BYMONTHDAY={d}"
             summary = f"every {d}th of the month"
         else:
-            # Check for specific days: "every monday and friday"
+            # Specific days: "every monday and friday"
             days_found = re.findall(
                 r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)",
                 period,
@@ -844,7 +1079,7 @@ def extract_recurrence(text: str) -> Optional[Dict]:
             else:
                 return None
 
-    # Check for UNTIL
+    # Check for UNTIL clause
     until_str = _parse_until(text)
     if until_str:
         base += f";UNTIL={until_str}"
@@ -862,6 +1097,15 @@ def extract_recurrence(text: str) -> Optional[Dict]:
 
 
 def extract_task_title(text: str) -> str:
+    """Extract a clean task title by stripping intent prefixes, date/time
+    phrases, recurrence patterns, and noise words from the raw text.
+
+    Args:
+        text: Raw user text.
+
+    Returns:
+        str: The cleaned and capitalised task title.
+    """
     cleaned = _STRIP_INTENTS_RE.sub(" ", text)
     cleaned = _STRIP_DATES_RE.sub(" ", cleaned)
     cleaned = _RECURRENCE_RE.sub(" ", cleaned)
@@ -872,7 +1116,17 @@ def extract_task_title(text: str) -> str:
 
 
 def extract_habit_title(text: str) -> str:
-    """Like extract_task_title but also strips count expressions."""
+    """Extract a clean habit title, also stripping count expressions.
+
+    Like ``extract_task_title`` but additionally removes patterns like
+    ``"4 times"``, ``"30 min"``, etc.
+
+    Args:
+        text: Raw user text.
+
+    Returns:
+        str: The cleaned and capitalised habit title.
+    """
     cleaned = extract_task_title(text)
     cleaned = _STRIP_COUNT_RE.sub(" ", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" .,")
@@ -888,8 +1142,19 @@ _SLOT_RE = re.compile(
 
 
 def extract_multi_slots(text: str) -> Optional[list]:
-    """Returns list of datetimes if 2+ day/time slots found, else None.
-    Also returns a list of (datetime, had_time) tuples for clarification checks."""
+    """Detect multiple day/time slots in a single message.
+
+    Used for patterns like ``"schedule running on Wednesday 9pm and Friday 7am"``.
+
+    Args:
+        text: Raw user text.
+
+    Returns:
+        Optional[list]: A list of parsed datetimes if 2+ slots are found,
+            or ``None``. The list has an attached ``_had_times`` attribute
+            (list of bools) indicating whether each slot included an explicit
+            time component.
+    """
     slots = _SLOT_RE.findall(text)
     if len(slots) < 2:
         return None
@@ -902,14 +1167,27 @@ def extract_multi_slots(text: str) -> Optional[list]:
             had_times.append(_slot_has_time(s))
     if len(parsed) < 2:
         return None
-    # Attach time-info as an extra attribute for downstream use
     result = parsed
     result._had_times = had_times if len(had_times) == len(parsed) else None
     return result
 
 
 def extract_reminder_title(text: str) -> str:
-    """Extract what the reminder is about from natural language."""
+    """Extract the reminder message text from a natural language reminder
+    request.
+
+    Handles several patterns:
+        - ``"remind me to X"`` / ``"remind me about X"``
+        - ``"set a reminder to X"``
+        - ``"remind me [time] to X"``
+        - Fallback: raw text with noise words stripped.
+
+    Args:
+        text: Raw user text.
+
+    Returns:
+        str: The extracted reminder title, capitalised.
+    """
     t = text.strip()
 
     # "remind me [time] to/about X"
@@ -919,17 +1197,12 @@ def extract_reminder_title(text: str) -> str:
         if len(title) > 2:
             return title.capitalize()
 
-    # "set a reminder (for/to) ... to/about X"
-    m = re.search(r"(?:set\s+(?:a\s+)?reminder\s+(?:for|to))\s+.{0,30}?\s+(?:to|about)\s+(.+)$", t, re.IGNORECASE)
-    if m:
-        return m.group(1).strip().capitalize()
-
-    # "remind me to X"
+    # "remind me to X" (simpler pattern)
     m = re.search(r"remind\s+me\s+(?:to|about)\s+(.+)$", t, re.IGNORECASE)
     if m:
         return re.sub(r"\s+(?:by|before|at|on)\s+.+$", "", m.group(1), flags=re.IGNORECASE).strip(" .,").capitalize()
 
-    # Fallback: strip noise
+    # Fallback: strip noise words
     cleaned = re.sub(r"\b(remind(?:\s+me)?|set\s+a\s+reminder(?:\s+for)?)\b", "", t, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(tomorrow|today|tonight|next\s+\w+|this\s+\w+)\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\d{1,2}(?::\d{2})?\s*(?:am|pm)", "", cleaned, flags=re.IGNORECASE)
@@ -939,6 +1212,28 @@ def extract_reminder_title(text: str) -> str:
 
 
 def parse_message(text: str) -> Dict:
+    """Full message parser — detect intent and extract structured data.
+
+    This is the main entry point for regex-based parsing. It returns a
+    dictionary with the detected intent and any extracted fields (title,
+    datetime, duration, recurrence, category, energy, etc.). The fields
+    present depend on the intent type.
+
+    Args:
+        text: Raw user message.
+
+    Returns:
+        Dict: A parsed dict with at minimum an ``intent`` key and a ``raw``
+            key containing the original text. Additional keys vary by intent:
+            - ``"add"``: ``datetime``, ``title``, ``reminder``, ``recurrence``
+            - ``"schedule"`` / ``"schedule_direct"``: same + ``duration``,
+              ``category``, ``energy``, ``splittable``
+            - ``"free_time"`` / ``"plan"``: ``datetime``, ``duration``,
+              ``category``, ``energy``
+            - ``"reminder"``: ``datetime``, ``title``, ``recurrence``,
+              ``duration`` (always 15)
+            - ``"habit_add"``: ``title``, ``count``, ``notes``, ``frequency``
+    """
     intent = detect_intent(text)
     result: Dict = {"intent": intent, "raw": text}
 
@@ -948,7 +1243,6 @@ def parse_message(text: str) -> Dict:
         result["reminder"]    = extract_reminder_minutes(text)
         result["recurrence"]  = extract_recurrence(text)
         result["multi_slots"] = extract_multi_slots(text)
-        # duration, category, energy, splittable omitted for "add" — user sets those when scheduling
         if intent != "add":
             result["duration"]    = extract_duration(text)
             result["category"]    = infer_category(text)
