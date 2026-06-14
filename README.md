@@ -13,276 +13,50 @@
 
 ## 🏗 System Architecture
 
-### Overview
+The following diagrams provide a high-level overview of the system architecture and scheduling workflow. They intentionally focus on the main components and interactions rather than implementation details.
 
-Planning Bot is a personal task management system that accepts natural language input via Telegram, stores tasks in a local SQLite database, and schedules them into Google Calendar using an intelligent slot-finding engine. The bot runs automated daily, weekly, and minutely jobs (morning briefings, evening planning prompts, calendar reminders, overdue task lifecycle, stale event cleanup) via APScheduler.
-
-**Target users:** Single-user (gated by `ALLOWED_USER_ID`). Designed for personal productivity — one person managing their own tasks, calendar, and habits.
-
-**Real-world problem:** Most task managers require structured input, manual calendar blocking, and separate apps for tasks vs. calendar. This bot provides a unified interface where the user types natural language ("finish report by next Friday needs 2 hours"), the system parses the intent, stores the task, finds free Google Calendar slots, and suggests placements — all within Telegram.
-
-**Key technical features:**
-- Natural language parsing via regex (primary) and optional LLM (Gemini via OpenRouter)
-- Google Calendar CRUD with OAuth 2.0 token refresh
-- Smart scheduling with sleep/meal blocking, task scoring by deadline/priority/category/energy
-- 9 automated background jobs (APScheduler)
-- Overdue task lifecycle (reminder at day 1, warning at day 7, auto-delete at day 8+)
-- Recurring events and reminders
-- Inline "Done" and "Undo" buttons
-
----
-
-### Context Diagram
-
-```mermaid
-flowchart LR
-  User["User\n(Single person managing\ntasks & calendar)"]
-  Telegram["Telegram Bot API\n(Message delivery & inline UI)"]
-  Bot["Planning Bot\n(Task management, scheduling,\nGoogle Calendar integration)"]
-  GoogleCal["Google Calendar API\n(Event CRUD & reminders)"]
-  OpenRouter["OpenRouter / Gemini API\n(AI parsing & recommendations)"]
-
-  User -- "Sends messages,\nreceives notifications" --> Telegram
-  Telegram -- "Long polling relay" --> Bot
-  Bot -- "Responds with text,\nmarkdown, inline buttons" --> Telegram
-  Bot -- "Create, read, update,\ndelete calendar events" --> GoogleCal
-  Bot -. "Parse complex intents,\ngenerate suggestions" .-> OpenRouter
-```
-
-**How it works:** The user sends a Telegram message to the bot. The message flows through Telegram's infrastructure to the running Python application. The bot parses the intent (either via regex NLP or via Gemini LLM), executes the appropriate handler (add task, list tasks, schedule into calendar, etc.), and sends a response back through Telegram.
-
-**External dependencies:** The system depends on three external services: Telegram Bot API for message delivery, Google Calendar API for event management, and optionally OpenRouter (Gemini) for advanced parsing and recommendations. All three are accessed over HTTPS — the system has no direct user-facing web interface.
-
----
-
-### Container Diagram
-
-```mermaid
-flowchart TB
-  User["User\n(Telegram user)"]
-  Telegram["Telegram Bot API"]
-
-  subgraph Bot["Planning Bot — Python Application"]
-    direction TB
-    BotLayer["Telegram Bot Layer\nbot.py\nCommand handlers, message router,\nstate machine, callback handler"]
-    NLP["NLP Parser (Regex)\nnlp.py\nIntent detection, datetime/duration/\nrecurrence extraction"]
-    LLM["LLM Gateway\nllm.py\nGemini parsing via OpenRouter,\ncalendar query answering"]
-    Scheduler["Scheduler Engine\nscheduler.py\n9 APScheduler jobs: morning, evening,\nweekly, reminders, overdue, cleanup"]
-    SmartSched["Smart Scheduling\nsmart_schedule.py\nFree slot finder, task scoring,\ngreedy planner with split support"]
-    CalClient["Calendar Client\ncalendar_client.py\nOAuth, token refresh,\nGoogle Calendar CRUD"]
-    DB["Database Layer\ndb.py\nSQLite: tasks, habits,\nreminders, sent_reminders"]
-  end
-
-  GoogleCal["Google Calendar API"]
-  OpenRouter["OpenRouter / Gemini"]
-
-  User --> Telegram
-  Telegram --> BotLayer
-  BotLayer --> NLP
-  BotLayer --> LLM
-  BotLayer --> DB
-  BotLayer --> CalClient
-  BotLayer --> SmartSched
-  BotLayer --> Scheduler
-  Scheduler --> DB
-  Scheduler --> CalClient
-  SmartSched --> CalClient
-  SmartSched --> OpenRouter
-  LLM --> OpenRouter
-  LLM --> NLP
-  CalClient --> GoogleCal
-```
-
-#### Container Descriptions
-
-| Container | File(s) | Purpose | Input | Output |
-|-----------|---------|---------|-------|--------|
-| **Telegram Bot Layer** | `bot.py` | Entry point. Routes messages to handlers, manages state machine (scheduling flow, confirmation, editing). Handles inline button callbacks (Done, Undo, Plan). | Telegram updates (text, callbacks), env config | Telegram responses (text, markdown, inline keyboards) |
-| **NLP Parser (Regex)** | `nlp.py` | Regex-based intent detection (18 intent patterns), datetime extraction with 8 fallback strategies, duration/recurrence/reminder parsing. Primary parsing path. | Raw user text | Structured dict with intent, title, datetime, duration, recurrence, category, energy, splittable |
-| **LLM Gateway** | `llm.py` | Optional Gemini 2.5 Flash Lite via OpenRouter. Handles complex multi-intent messages, calendar queries, and generates weekly/daily recommendations. Falls back to regex on failure. | User text + optional conversation context | Parsed JSON dict; natural language answers for calendar queries |
-| **Scheduler Engine** | `scheduler.py` | 9 APScheduler jobs: morning briefing, midday urgency check, evening planning, Sunday weekly review, Sunday weekly planning, calendar reminders (1 min), app reminders (1 min), overdue task lifecycle (daily), stale event cleanup (1 hr). | APScheduler triggers | Telegram messages to user, database updates |
-| **Smart Scheduling** | `smart_schedule.py` | Free slot finder (respects sleep 11pm-7am, soft-blocks meals). Task scoring by deadline pressure, category fit, energy level. Greedy planner with split support. AI slot suggestion via Gemini. | Calendar events + task properties | Free slot list, ranked task-slot assignments, natural language plan |
-| **Calendar Client** | `calendar_client.py` | Full Google Calendar CRUD. OAuth 2.0 with automatic token refresh. Custom reminder minutes. Recurring event support. List, search, reschedule events. | Event properties (title, start, duration, reminder, rrule) | Calendar event ID |
-| **Database Layer** | `db.py` | SQLite with 4 tables: `tasks` (priority, deadline, category, energy, scheduled times), `habits` (frequency, count), `reminders` (title, remind_at, recurrence), `sent_reminders` (dedup key). 30+ query functions. | SQL queries | Row objects with dict-like access (sqlite3.Row) |
-
----
-
-### Scheduling Workflow
+### Diagram 1 — System Architecture
 
 ```mermaid
 flowchart TD
-    A["User sends: 'schedule gym on Wednesday 9pm'"] --> B["bot.py: handle_message()"]
-    B --> C{"State machine?"}
-    C -->|"idle"| D["bot.py: try LLM parse first"]
-    D --> E{"LLM returned result?"}
-    E -->|"Yes"| F["llm.normalise() → parsed dict"]
-    E -->|"No / fallback"| G["nlp.parse_message() → parsed dict"]
-    F --> H["Dispatch by intent"]
-    G --> H
-    H --> I{"intent == 'schedule_direct'?"}
-    I -->|"Yes"| J["_schedule_direct_intent()"]
-    I -->|"No"| K["Other handler (add, list, etc.)"]
-    J --> L{"Has datetime?"}
-    L -->|"Yes"| M["_confirm_schedule state → ask 'Reply yes to confirm'"]
-    L -->|"No"| N["smart_schedule.get_free_slots()"]
-    N --> O["smart_schedule.build_suggestion_message()"]
-    O --> P["Set state=schedule_direct, send suggestion"]
-    P --> Q["User replies 'yes'"]
-    Q --> R["_schedule_direct_time()"]
-    R --> S{"Confirm?"}
-    M --> S
-    S -->|"User: 'yes'"| T["calendar_client.create_event()"]
-    S -->|"User: 'no'"| U["Skip / ask for different time"]
-    T --> V["db.update_task() with calendar_event_id"]
-    V --> W["Send confirmation to user"]
+    User["User"]
+    Telegram["Telegram"]
+    Bot["Planning Bot"]
+    Database["SQLite Database"]
+    Calendar["Google Calendar"]
+    AI["AI Service"]
+
+    User <--> Telegram
+    Telegram <--> Bot
+    Bot <--> Database
+    Bot <--> Calendar
+    Bot <--> AI
 ```
 
-**Step-by-step walkthrough:**
-
-1. **Message ingestion**: The user sends a natural language message via Telegram. `bot.py:handle_message()` receives the `Update` object.
-
-2. **State machine check**: If the user is in a conversation state (e.g., confirming a schedule, providing a time), the state-specific handler processes the input directly without re-parsing.
-
-3. **LLM parse (primary)**: `llm.parse()` sends the message to Gemini 2.5 Flash Lite via OpenRouter. The system prompt defines 18 possible intents, extraction rules, and time-of-day mappings. Returns structured JSON.
-
-4. **Regex fallback**: If the LLM is unavailable (no API key, timeout, rate limit) or returns no result, `nlp.parse_message()` applies regex-based intent detection and datetime extraction with 8 fallback strategies.
-
-5. **Intent dispatch**: The parsed intent routes to the appropriate handler. For scheduling, `_schedule_direct_intent()` checks if a datetime was provided.
-
-6. **Free slot detection**: If no time was given, `smart_schedule.get_free_slots()` queries Google Calendar for upcoming events, builds busy blocks, and returns free windows respecting sleep (11pm–7am) and meal times. Each slot includes start, end, and duration.
-
-7. **Slot suggestion**: `build_suggestion_message()` optionally calls Gemini to pick the best slot based on task type. The top suggestion is presented with alternative options.
-
-8. **User confirmation**: The bot enters `confirm_schedule` state, showing the proposed time, duration, and reminder setting. The user replies "yes" to confirm or "no" to cancel.
-
-9. **Calendar event creation**: `calendar_client.create_event()` calls the Google Calendar v3 API with the event body (title, start/end datetimes, reminder overrides, optional recurrence rule).
-
-10. **Database update**: `db.update_task()` records the `calendar_event_id`, `scheduled_start`, and `scheduled_end`, and sets status to `in_progress`.
-
----
-
-### Module Dependencies
+### Diagram 2 — Scheduling Workflow
 
 ```mermaid
-graph TD
-    subgraph Entry
-        bot_py["bot.py"]
-    end
+sequenceDiagram
+    participant User
+    participant Telegram
+    participant Bot
+    participant AI
+    participant Calendar
+    participant Database
 
-    subgraph Parsing
-        nlp["nlp.py"]
-        llm["llm.py"]
-    end
-
-    subgraph Scheduling
-        scheduler["scheduler.py"]
-        smart_sched["smart_schedule.py"]
-    end
-
-    subgraph Calendar
-        cal_client["calendar_client.py"]
-        auth_cal["auth_calendar.py"]
-    end
-
-    subgraph Storage
-        db["db.py"]
-    end
-
-    subgraph Config
-        config["config.py"]
-    end
-
-    bot_py --> nlp
-    bot_py --> llm
-    bot_py --> cal_client
-    bot_py --> smart_sched
-    bot_py --> db
-    bot_py --> config
-    bot_py --> scheduler
-
-    scheduler --> db
-    scheduler --> cal_client
-    scheduler --> smart_sched
-
-    smart_sched --> cal_client
-    smart_sched --> llm
-
-    llm --> nlp
-
-    cal_client -.-> auth_cal
-
-    config --> bot_py
-    config --> scheduler
-    config --> cal_client
+    User->>Telegram: Sends task
+    Telegram->>Bot: Receives task
+    Bot->>AI: Interprets task
+    AI->>Bot: Returns parsed intent
+    Bot->>Calendar: Checks availability
+    Calendar->>Bot: Returns free slots
+    Bot->>Bot: Generates schedule
+    Bot->>Database: Stores event
+    Bot->>Telegram: Sends result
+    Telegram->>User: Shows confirmation
 ```
-
-**Import relationships:** `bot.py` is the central hub, importing 6 of the 7 other modules. `scheduler.py` imports `db` and conditionally imports `calendar_client` and `smart_schedule` (lazy imports to prevent auth failures from crashing scheduler startup). `smart_schedule.py` imports `calendar_client` directly and `requests` for Gemini calls. `llm.py` conditionally imports `nlp.py` as a fallback helper. `config.py` is a thin dotenv loader consumed by `bot.py`, `scheduler.py`, and `calendar_client.py`.
-
----
-
-### Deployment
-
-```mermaid
-flowchart TB
-  subgraph UserDevice["User Device"]
-    TGClient["Telegram Client"]
-  end
-
-  subgraph External["External Services"]
-    TGPlatform["Telegram Platform"]
-    GoogleAPI["Google Calendar API"]
-    GeminiAPI["OpenRouter / Gemini API"]
-  end
-
-  subgraph VPS["Linux VPS (Ubuntu/Debian)"]
-    subgraph SystemD["systemd"]
-      Service["planner-bot.service"]
-    end
-
-    subgraph PythonRuntime["Python Runtime 3.10+"]
-      BotMain["bot.py\n(entry point)"]
-      SchedulerJobs["scheduler jobs\n(9 APScheduler tasks)"]
-    end
-
-    subgraph FileSystem["File System"]
-      EnvFile[".env\n(environment variables)"]
-      TokenFile["token.json\n(Google OAuth credentials)"]
-      DBFile["planner.db\n(SQLite database)"]
-    end
-  end
-
-  TGClient --> TGPlatform
-  TGPlatform --> BotMain
-  BotMain --> TGPlatform
-  BotMain --> GoogleAPI
-  BotMain --> GeminiAPI
-  BotMain --> DBFile
-  SchedulerJobs --> GoogleAPI
-  SchedulerJobs --> DBFile
-  EnvFile --- BotMain
-  TokenFile --- BotMain
-  Service --- PythonRuntime
-```
-
-**Production setup:** The bot runs as a systemd service on a headless Linux VPS (Ubuntu/Debian). The `oracle-planner.service` unit sets `WorkingDirectory=/opt/planner_bot`, loads `.env` as the environment file, and runs `venv/bin/python bot.py` with automatic restart on failure. The Google Calendar `token.json` is generated locally via `auth_calendar.py` (which requires a browser for OAuth consent) and then copied to the server via SCP. The SQLite database persists tasks, habits, and reminders. All three external services (Telegram, Google Calendar, OpenRouter) are accessed over HTTPS outbound — no inbound ports are required beyond standard SSH for administration.
-
----
 
 ### Key Components
-
-| Component | File(s) | Responsibility |
-|-----------|---------|----------------|
-| Telegram Bot Layer | `bot.py` | Entry point, command handlers (20+), message router, state machine (idle/scheduling/confirm/editing/clarifying), inline callback handler (Done/Undo/Plan), reply-to-edit |
-| NLP Parser (Regex) | `nlp.py` | 18 intent patterns, datetime extraction (8 strategies), duration/recurrence/reminder parsing, category/energy inference, multi-slot detection |
-| LLM Gateway | `llm.py` | Gemini 2.5 Flash Lite via OpenRouter, intent normalisation, calendar query answering |
-| Scheduler Engine | `scheduler.py` | 9 APScheduler jobs: morning briefing, midday urgency, evening planning, Sunday weekly review, Sunday planning (with inline buttons), calendar reminders (1 min), app reminders (1 min), overdue lifecycle (daily), stale event cleanup (1 hr) |
-| Smart Scheduling | `smart_schedule.py` | Free slot finder (sleep 11pm-7am blocked, meals soft-blocked), task scoring (deadline pressure, category fit, energy level), greedy planner with split support, AI slot suggester |
-| Calendar Client | `calendar_client.py` | Google Calendar v3 API: OAuth 2.0 token refresh, create/update/delete events, recurring events, custom reminders, list/search/reschedule events |
-| Database Layer | `db.py` | SQLite CRUD: 4 tables (tasks, habits, reminders, sent_reminders), 30+ query functions, auto-migration via `_ensure_column()` |
-| Auth Script | `auth_calendar.py` | One-time OAuth 2.0 consent flow, writes `token.json` |
-| Configuration | `config.py` | Loads env vars from `.env` via python-dotenv, exports TELEGRAM_TOKEN, ALLOWED_USER_ID, TIMEZONE, DB_PATH, OPENROUTER_API_KEY |
-
-### Technology Stack
 
 | Category | Technology |
 |----------|------------|

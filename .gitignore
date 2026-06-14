@@ -47,3 +47,7 @@ planner/
 
 # Railway
 .railway/
+
+# Generated reports and presentation files
+short_report.md
+presentation_10_slides.md
