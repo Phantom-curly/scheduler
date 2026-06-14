@@ -1,17 +1,48 @@
-"""
-Planning Telegram Bot — main entry point.
+# Copyright (c) 2026 Planning Bot Contributors
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
-State machine in context.user_data['state']:
-  idle            → normal routing
-  scheduling      → collecting time/duration for a batch of tasks
-  schedule_direct → collecting time for a direct calendar event
-  deleting        → confirmation
-  updating        → collecting new value
-  reminder_time   → collecting time for an app reminder
-  plan_confirm    → confirming suggested task/calendar placements
-  reschedule_pick → picking one calendar event from matches
-  reschedule_time → collecting new time for a calendar event
-  clarifying      → collecting an LLM clarification answer
+"""
+Telegram bot entry point — command handlers, state machine, and message router
+for the Planning Bot.
+
+This module is the application's main entry point. It builds a
+``telegram.ext.Application`` with long polling, registers command handlers
+(``/start``, ``/tasks``, ``/today``, ``/tomorrow``, ``/week``, ``/habits``,
+``/free``, ``/plan``, ``/now``, ``/cancel``, ``/help``), and a catch-all
+message handler that routes messages through a hybrid parsing pipeline
+(LLM primary, regex NLP fallback).
+
+State machine
+=============
+The bot maintains ``context.user_data['state']`` with 12 conversation states:
+``idle``, ``scheduling``, ``schedule_direct``, ``deleting``, ``updating``,
+``reminder_time``, ``plan_confirm``, ``reschedule_pick``, ``reschedule_time``,
+``clarifying``, ``replying_delete``, ``replying_update``.
+
+Key features
+============
+- Natural language task creation and scheduling
+- Inline keyboard callbacks (Done, Undo, Plan)
+- Reply-to-edit: users can reply to any bot message containing an entity
+  reference (``📎 t#42``) to edit or delete that entity inline
+- Hybrid parsing: LLM (Gemini via OpenRouter) primary, regex NLP fallback
 """
 
 import asyncio
@@ -48,7 +79,19 @@ logger = logging.getLogger(__name__)
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
+
 def _authorized(update: Update) -> bool:
+    """Check whether the user is authorised to interact with this bot.
+
+    If ``ALLOWED_USER_ID`` is 0 (the default), all users are allowed.
+    Otherwise, only the user with the matching Telegram user ID is permitted.
+
+    Args:
+        update: The incoming Telegram update.
+
+    Returns:
+        bool: ``True`` if the user is authorised.
+    """
     if ALLOWED_USER_ID == 0:
         return True
     return update.effective_user.id == ALLOWED_USER_ID
@@ -56,10 +99,20 @@ def _authorized(update: Update) -> bool:
 
 # ── Formatting ─────────────────────────────────────────────────────────────────
 
+# Emoji icons mapped to task status values
 STATUS_ICON = {"pending": "⏳", "in_progress": "🔄", "done": "✅"}
 
 
 def _fmt_deadline(d):
+    """Format an ISO date string into a human-readable short form.
+
+    Args:
+        d: An ISO date string (e.g. ``"2026-06-19"``).
+
+    Returns:
+        str: Formatted date like ``"Fri Jun 19"``, or the original string if
+            parsing fails.
+    """
     try:
         return datetime.fromisoformat(d).strftime("%a %b %d")
     except Exception:
@@ -67,12 +120,34 @@ def _fmt_deadline(d):
 
 
 def _fmt_dt(dt):
+    """Format a timezone-aware datetime for display in Telegram messages.
+
+    Args:
+        dt: A datetime object.
+
+    Returns:
+        str: Formatted string like ``"Thu Jun 11, 2:00 PM"`` with leading
+            zeros stripped from the hour.
+    """
     return dt.strftime("%a %b %d, %I:%M %p").lstrip("0")
 
 
 PRIORITY_ICON = {"high": "🔴", "medium": "🟡", "low": "🟢"}
 
+
 def _fmt_task_row(idx, task):
+    """Format a single task as a one-line summary string for a task list.
+
+    Includes status icon, priority icon, title, deadline indicator, and a
+    calendar-scheduled tag if applicable.
+
+    Args:
+        idx: 1-based index in the list.
+        task: A task dict (from ``sqlite3.Row`` or dict).
+
+    Returns:
+        str: Formatted task line.
+    """
     icon     = STATUS_ICON.get(task["status"], "⏳")
     p_icon   = PRIORITY_ICON.get(task["priority"] or "medium", "🟡")
     cal_tag  = " 📅" if task["calendar_event_id"] else ""
@@ -81,6 +156,14 @@ def _fmt_task_row(idx, task):
 
 
 def _fmt_task_list(tasks):
+    """Format a list of tasks into a multi-line Telegram message.
+
+    Args:
+        tasks: A list of task dicts.
+
+    Returns:
+        str: Newline-separated task lines, or ``"No tasks found."``.
+    """
     if not tasks:
         return "No tasks found."
     return "\n".join(_fmt_task_row(i + 1, t) for i, t in enumerate(tasks))
@@ -88,13 +171,25 @@ def _fmt_task_list(tasks):
 
 # ── Entity references (for reply-to-edit) ──────────────────────────────────────
 
+# Regex to extract entity references from bot messages.
+# Format: 📎 t#42 (task), 📎 r#7 (reminder), 📎 e#abc123 (calendar event)
 _ENTITY_REF_RE = re.compile(r"📎\s*(t|r|e)#(\S+)", re.IGNORECASE)
 
 
 def _parse_entity_ref(text: str):
-    """Extract entity reference from a bot message.
-    Returns (type, id) where type is 'task', 'reminder', or 'cal_event',
-    or None if no reference found."""
+    """Extract an entity reference from a bot message.
+
+    The reference format is ``📎 t#<id>`` for tasks, ``📎 r#<id>`` for
+    reminders, and ``📎 e#<id>`` for calendar events.
+
+    Args:
+        text: The bot message text.
+
+    Returns:
+        tuple or None: ``(entity_type, entity_id)`` where ``entity_type`` is
+            ``"task"``, ``"reminder"``, or ``"cal_event"``, or ``None`` if no
+            reference is found.
+    """
     if not text:
         return None
     m = _ENTITY_REF_RE.search(text)
@@ -107,15 +202,32 @@ def _parse_entity_ref(text: str):
 
 
 def _entity_ref_line(entity_type: str, entity_id) -> str:
-    """Build the reference line to append to a bot message."""
+    """Build a reference line to append to a bot message for reply-to-edit.
+
+    Args:
+        entity_type: ``"task"``, ``"reminder"``, or ``"cal_event"``.
+        entity_id: The entity's ID.
+
+    Returns:
+        str: A reference line like ``"\\n📎 t#42"``.
+    """
     prefix_map = {"task": "t", "reminder": "r", "cal_event": "e"}
     p = prefix_map.get(entity_type, "?")
     return f"\n📎 {p}#{entity_id}"
 
 
 def _fmt_entity(entity_type: str, entity) -> str:
-    """Format an entity's current state for the edit-confirmation message."""
-    # sqlite3.Row doesn't support .get(), convert to dict
+    """Format an entity's current state for an edit-confirmation message.
+
+    Converts ``sqlite3.Row`` to dict internally for safe access.
+
+    Args:
+        entity_type: ``"task"`` or ``"reminder"``.
+        entity: A row object or dict.
+
+    Returns:
+        str: Formatted entity details with emoji labels.
+    """
     if entity is not None:
         entity = dict(entity)
     else:
@@ -149,19 +261,32 @@ def _fmt_entity(entity_type: str, entity) -> str:
 
 async def _handle_reply_edit(update, context) -> bool:
     """Try to interpret a reply as an edit/delete to the referenced entity.
-    Supports:
-      - Reply with "delete" → enters confirmation flow
-      - Reply with "update" → enters update flow
-      - Reply with a datetime → updates time
-      - Reply with "title: New Title" → updates title
-      - Reply with "time: <datetime>" → updates time
-      - Reply with plain text (no keywords) → updates title
 
-    Returns True if the reply was handled as an edit, False to fall through."""
+    When a user replies to a bot message that contains an entity reference
+    (``📎 t#42``), this handler processes the reply text as an edit or delete
+    command.
+
+    Supported actions:
+        - Reply with ``"delete"`` → enters deletion confirmation flow.
+        - Reply with ``"update"`` → enters interactive update flow.
+        - Reply with a datetime → updates time (for tasks: deadline;
+          for reminders/events: start time).
+        - Reply with ``"title: New Title"`` → updates title.
+        - Reply with ``"time: <datetime>"`` → updates time.
+        - Reply with plain text (no keywords) → updates title (if long enough
+          and not a command keyword).
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context (holds ``user_data`` state).
+
+    Returns:
+        bool: ``True`` if the reply was handled as an edit, ``False`` to fall
+            through to normal message routing.
+    """
     replied = update.message.reply_to_message
     text = update.message.text.strip()
 
-    # Extract entity reference from the replied message
     ref = _parse_entity_ref(replied.text or "")
     if not ref:
         return False
@@ -169,14 +294,13 @@ async def _handle_reply_edit(update, context) -> bool:
     entity_type, entity_id = ref
     text_lower = text.lower()
 
-    # ─── "delete" keyword → confirmation flow ──────────────────────────────────
+    # "delete" keyword → confirmation flow
     if text_lower in ("delete", "remove", "del", "rm", "🗑"):
         context.user_data["reply_delete"] = {
             "entity_type": entity_type,
             "entity_id": entity_id,
         }
         context.user_data["state"] = "replying_delete"
-
         type_emoji = {"task": "📝", "reminder": "🔔", "cal_event": "📅"}
         emoji = type_emoji.get(entity_type, "❓")
         title = _get_entity_title(entity_type, entity_id) or "this item"
@@ -186,7 +310,7 @@ async def _handle_reply_edit(update, context) -> bool:
         )
         return True
 
-    # ─── "update" keyword → enter interactive update flow ──────────────────────
+    # "update" keyword → enter interactive update flow
     if text_lower in ("update", "edit", "change", "modify", "✏️"):
         context.user_data["reply_update"] = {
             "entity_type": entity_type,
@@ -194,7 +318,6 @@ async def _handle_reply_edit(update, context) -> bool:
         }
         context.user_data["state"] = "replying_update"
         title = _get_entity_title(entity_type, entity_id) or "this item"
-
         await update.message.reply_text(
             f"✏️ Updating *{title}*\n\n"
             "What to change? Reply with:\n"
@@ -206,10 +329,7 @@ async def _handle_reply_edit(update, context) -> bool:
         )
         return True
 
-    # ─── Try to parse as a time update ─────────────────────────────────────────
     new_dt = nlp.extract_datetime(text)
-
-    # Check for explicit "title:" or "time:" prefixes
     title_prefix = re.match(r"^title:\s*(.+)$", text, re.IGNORECASE)
     time_prefix  = re.match(r"^time:\s*(.+)$", text, re.IGNORECASE)
 
@@ -218,8 +338,6 @@ async def _handle_reply_edit(update, context) -> bool:
         if not reminder:
             await update.message.reply_text("⚠️ That reminder no longer exists.")
             return True
-
-        # "time: <datetime>"
         if time_prefix:
             dt = nlp.extract_datetime(time_prefix.group(1))
             if not dt:
@@ -233,8 +351,6 @@ async def _handle_reply_edit(update, context) -> bool:
                 parse_mode="Markdown",
             )
             return True
-
-        # "title: New Title"
         if title_prefix:
             new_title = title_prefix.group(1).strip().capitalize()
             if len(new_title) < 2:
@@ -248,8 +364,6 @@ async def _handle_reply_edit(update, context) -> bool:
                 parse_mode="Markdown",
             )
             return True
-
-        # New datetime → update time
         if new_dt:
             db.update_reminder(reminder["id"], remind_at=new_dt.isoformat())
             reminder = db.get_reminder(reminder["id"])
@@ -259,8 +373,6 @@ async def _handle_reply_edit(update, context) -> bool:
                 parse_mode="Markdown",
             )
             return True
-
-        # Plain text → new title (if long enough, not a command keyword)
         if len(text) > 2 and not _is_command_keyword(text):
             db.update_reminder(reminder["id"], title=text)
             reminder = db.get_reminder(reminder["id"])
@@ -270,7 +382,6 @@ async def _handle_reply_edit(update, context) -> bool:
                 parse_mode="Markdown",
             )
             return True
-
         return False
 
     elif entity_type == "task":
@@ -278,10 +389,7 @@ async def _handle_reply_edit(update, context) -> bool:
         if not task:
             await update.message.reply_text("⚠️ That task no longer exists.")
             return True
-
         updates = {}
-
-        # "time: <datetime>" → new deadline
         if time_prefix:
             dt = nlp.extract_datetime(time_prefix.group(1))
             if dt:
@@ -289,24 +397,16 @@ async def _handle_reply_edit(update, context) -> bool:
             else:
                 await update.message.reply_text("Couldn't parse that time. Try `time: next Friday`.")
                 return True
-
-        # "title: New Title"
         if title_prefix:
             new_title = title_prefix.group(1).strip().capitalize()
             if len(new_title) >= 2:
                 updates["title"] = new_title
-
-        # Plain datetime → new deadline
         if not title_prefix and not time_prefix and new_dt:
             updates["deadline"] = new_dt.date().isoformat()
-
-        # Plain text (no datetime, no prefix) → new title (not a command keyword)
         if not updates and len(text) > 2 and not _is_command_keyword(text):
             updates["title"] = text
-
         if updates:
             db.update_task(task["id"], **updates)
-            # If title changed and event exists, update calendar too
             if "title" in updates and task["calendar_event_id"]:
                 try:
                     calendar_client.update_event(task["calendar_event_id"], title=updates["title"])
@@ -319,11 +419,9 @@ async def _handle_reply_edit(update, context) -> bool:
                 parse_mode="Markdown",
             )
             return True
-
         return False
 
     elif entity_type == "cal_event":
-        # "time: <datetime>"
         if time_prefix:
             dt = nlp.extract_datetime(time_prefix.group(1))
             if not dt:
@@ -343,7 +441,6 @@ async def _handle_reply_edit(update, context) -> bool:
             except Exception as exc:
                 await update.message.reply_text(f"⚠️ Couldn't update calendar event: {exc}")
                 return True
-
         if not new_dt:
             return False
         try:
@@ -364,7 +461,7 @@ async def _handle_reply_edit(update, context) -> bool:
     return False
 
 
-# Known command words that should never be treated as valid titles
+# Known command words that should never be treated as valid entity titles.
 _COMMAND_KEYWORDS = frozenset({
     "yes", "no", "ok", "cancel", "done", "y", "n",
     "delete", "remove", "del", "rm", "🗑",
@@ -375,13 +472,29 @@ _COMMAND_KEYWORDS = frozenset({
 
 
 def _is_command_keyword(text: str) -> bool:
-    """Check if text looks like a command word, not a real title."""
+    """Check if *text* looks like a command keyword rather than a real title.
+
+    Args:
+        text: The text to check.
+
+    Returns:
+        bool: ``True`` if the text is a recognised command keyword.
+    """
     return text.lower().strip() in _COMMAND_KEYWORDS
 
 
 def _get_entity_title(entity_type: str, entity_id) -> Optional[str]:
-    """Get a human-readable title for an entity by its type and id.
-    Returns None if the title looks like a corrupted command keyword."""
+    """Get a human-readable title for an entity by its type and ID.
+
+    Returns ``None`` if the title looks like a corrupted command keyword.
+
+    Args:
+        entity_type: ``"task"``, ``"reminder"``, or ``"cal_event"``.
+        entity_id: The entity's ID.
+
+    Returns:
+        Optional[str]: The entity's title, or ``None``.
+    """
     try:
         if entity_type == "task":
             t = db.get_task(int(entity_id))
@@ -390,11 +503,9 @@ def _get_entity_title(entity_type: str, entity_id) -> Optional[str]:
             r = db.get_reminder(int(entity_id))
             title = r["title"] if r else None
         elif entity_type == "cal_event":
-            return "calendar event"  # generic; can't search by id
+            return "calendar event"
         else:
             return None
-        # If the title is just a command keyword, it was likely corrupted by
-        # the old reply handler that didn't exclude command words
         if title and _is_command_keyword(title):
             return None
         return title
@@ -404,7 +515,14 @@ def _get_entity_title(entity_type: str, entity_id) -> Optional[str]:
 
 # ── Commands ───────────────────────────────────────────────────────────────────
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def cmd_start(update, context):
+    """Handle the ``/start`` command — send a welcome message.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
     await update.message.reply_text(
@@ -422,7 +540,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(update, context):
+    """Handle the ``/help`` command — show detailed usage reference.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
     await update.message.reply_text(
@@ -461,7 +585,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_tasks(update, context):
+    """Handle ``/tasks`` — list unscheduled pending tasks.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
     tasks = db.get_unscheduled_tasks_sorted()
@@ -480,7 +610,13 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_today(update, context):
+    """Handle ``/today`` — show tasks due today, calendar events, reminders.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
     import pytz
@@ -488,14 +624,12 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now(tz).date()
     tasks  = db.get_tasks_by_period(today, today)
     lines  = [f"📅 *Today — {today.strftime('%A %b %d')}*\n"]
-
     if tasks:
         context.user_data["last_task_list"] = [dict(t) for t in tasks]
         lines.append("📋 *Tasks:*")
         for i, t in enumerate(tasks):
             lines.append(_fmt_task_row(i + 1, t))
         lines.append("")
-
     try:
         events = calendar_client.get_todays_events()
         if events:
@@ -505,8 +639,6 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"  • *{title}* — {calendar_client.fmt_event_time_range(e)}")
     except Exception:
         pass
-
-    # Show reminders for today
     reminders = db.get_reminders_by_period(today, today)
     if reminders:
         lines.append("\n⏰ *Reminders:*")
@@ -518,28 +650,30 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 time_str = r["remind_at"]
             recur_tag = " 🔁" if r["recurrence_rrule"] else ""
             lines.append(f"  • 🔔 {r['title']} — {time_str}{recur_tag}")
-
     if len(lines) == 1:
         lines.append("Nothing on the plate today! 🎉")
-
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_tomorrow(update, context):
+    """Handle ``/tomorrow`` — show tasks due tomorrow and calendar events.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
     today    = datetime.now().date()
     tomorrow = today + timedelta(days=1)
     tasks    = db.get_tasks_by_period(tomorrow, tomorrow)
     lines    = [f"📅 *Tomorrow — {tomorrow.strftime('%A %b %d')}*\n"]
-
     if tasks:
         context.user_data["last_task_list"] = [dict(t) for t in tasks]
         lines.append("📋 *Tasks:*")
         for i, t in enumerate(tasks):
             lines.append(_fmt_task_row(i + 1, t))
         lines.append("")
-
     try:
         events = calendar_client.list_events_by_day(tomorrow)
         if events:
@@ -549,8 +683,6 @@ async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"  • *{title}* — {calendar_client.fmt_event_time_range(e)}")
     except Exception:
         pass
-
-    # Show reminders for tomorrow
     reminders = db.get_reminders_by_period(tomorrow, tomorrow)
     if reminders:
         lines.append("\n⏰ *Reminders:*")
@@ -562,14 +694,18 @@ async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 time_str = r["remind_at"]
             recur_tag = " 🔁" if r["recurrence_rrule"] else ""
             lines.append(f"  • 🔔 {r['title']} — {time_str}{recur_tag}")
-
     if len(lines) == 1:
         lines.append("Nothing on the plate tomorrow! 🎉")
-
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_week(update, context):
+    """Handle ``/week`` — full week view with tasks and events per day.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
     import pytz
@@ -577,7 +713,6 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now(tz).date()
     monday = today - timedelta(days=today.weekday())
     lines = [f"📆 *This Week* ({monday.strftime('%b %d')} — {(monday + timedelta(days=6)).strftime('%b %d')})\n"]
-
     has_content = False
     for day_offset in range(7):
         day = monday + timedelta(days=day_offset)
@@ -587,7 +722,6 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
             day_events = calendar_client.list_events_by_day(day)
         except Exception:
             pass
-
         if not day_tasks and not day_events:
             continue
         has_content = True
@@ -605,11 +739,8 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"  • *{title}* — {calendar_client.fmt_event_time_range(e)}")
             except Exception:
                 lines.append(f"  • *{e.get('summary','Event')}*")
-
     if not has_content:
         lines.append("Nothing scheduled this week 🎉")
-
-    # Also show unscheduled tasks
     unscheduled = db.get_unscheduled_tasks_sorted()
     if unscheduled:
         lines.append(f"\n📝 *Unscheduled ({len(unscheduled)}):*")
@@ -619,12 +750,17 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {i+1}. {p_icon} {t['title']}{due}")
         if len(unscheduled) > 5:
             lines.append(f"  _...and {len(unscheduled)-5} more_")
-
     context.user_data["last_task_list"] = [dict(t) for t in db.get_unscheduled_tasks_sorted()]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_reminders(update, context):
+    """Handle ``/reminders`` — list active bot-side reminders.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
     reminders = db.get_active_reminders()
@@ -644,7 +780,13 @@ async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def cmd_habits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_habits(update, context):
+    """Handle ``/habits`` — list active daily and weekly habits.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
     habits = db.get_habits(active_only=True)
@@ -679,7 +821,13 @@ async def cmd_habits(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def cmd_free(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_free(update, context):
+    """Handle ``/free`` — show free calendar blocks.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
     text = " ".join(context.args) if context.args else "find me 60 minutes this week"
@@ -688,13 +836,25 @@ async def cmd_free(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _free_time_intent(update, context, parsed)
 
 
-async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_plan(update, context):
+    """Handle ``/plan`` — auto-suggest task placements.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
     await _plan_tasks_intent(update, context, {"intent": "plan", "raw": "plan my tasks"})
 
 
-async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_now(update, context):
+    """Handle ``/now`` — show bot's current date, time, and timezone.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
     import pytz
@@ -709,7 +869,13 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_cancel(update, context):
+    """Handle ``/cancel`` — cancel current operation and clear state.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
     from telegram import ReplyKeyboardRemove
@@ -719,21 +885,36 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main message router ────────────────────────────────────────────────────────
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def handle_message(update, context):
+    """Main message router — routes all incoming text messages.
+
+    Routing order:
+        1. Check conversation state — dispatch to state-specific handlers.
+        2. Check reply-to-edit context (user replying to a bot message).
+        3. Check for ``"resume"`` keyword.
+        4. Try LLM parse (Gemini) as primary parser.
+        5. Fall back to ``nlp.parse_message()`` regex parsing.
+        6. Dispatch parsed intent to appropriate handler.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     if not _authorized(update):
         return
 
     text  = update.message.text.strip()
     state = context.user_data.get("state", "idle")
 
-    # NEW: Check if user is replying to a bot message to edit it
+    # Check reply-to-edit context
     if state == "idle" and update.message.reply_to_message:
         replied = update.message.reply_to_message
         if replied.from_user and replied.from_user.is_bot:
             if await _handle_reply_edit(update, context):
                 return
 
-    # Check for "resume" to restore paused scheduling
+    # "resume" keyword to restore paused scheduling
     if state == "idle" and text.strip().lower() == "resume":
         paused = context.user_data.get("paused_schedule")
         if paused:
@@ -745,6 +926,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _ask_schedule_time(update, context)
             return
 
+    # State-specific handlers
     if state == "scheduling":
         await _scheduling_time(update, context, text)
         return
@@ -763,36 +945,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == "replying_delete":
         await _reply_delete_confirm(update, context, text)
         return
-
     if state == "replying_update":
         await _reply_update_value(update, context, text)
         return
-
     if state == "reminder_time":
         pending  = context.user_data.pop("pending_reminder", {})
         title    = pending.get("title", "Reminder")
         recurrence = pending.get("recurrence")
         dt       = nlp.extract_datetime(text)
         if not dt:
-            # Try LLM
             p2 = llm_client.parse(text)
             if p2:
                 dt = llm_client.normalise(p2).get("datetime")
         if not dt:
             await update.message.reply_text("Couldn't parse that time. Try `tomorrow 4pm` or `Monday 9am`.")
-            # Put it back
             context.user_data["pending_reminder"] = pending
             return
         context.user_data["state"] = "idle"
         await _do_create_reminder(update, title, dt, recurrence)
         return
-
     if state == "plan_confirm":
         await _plan_confirm(update, context, text)
         return
-
     if state == "reschedule_pick":
-        # User picking which event to reschedule from a list
         if text.strip().isdigit():
             matches = context.user_data.get("reschedule_matches", [])
             new_dt  = context.user_data.get("reschedule_new_dt")
@@ -806,8 +981,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.user_data["state"]            = "reschedule_time"
                     context.user_data["reschedule_event"] = event
                     await update.message.reply_text(
-                        f"New time for *{event.get('summary','Event')}*? "
-                        "(e.g. `tomorrow 6pm`)",
+                        f"New time for *{event.get('summary','Event')}*? (e.g. `tomorrow 6pm`)",
                         parse_mode="Markdown",
                     )
             else:
@@ -815,30 +989,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("Reply with the number of the event.")
         return
-
     if state == "confirm_schedule":
         await _confirm_schedule(update, context, text)
         return
-
     if state == "reschedule_time":
         event  = context.user_data.get("reschedule_event")
         new_dt = nlp.extract_datetime(text)
         if not new_dt:
-            # Try with LLM
             p = llm_client.parse(text)
             if p:
                 new_dt = llm_client.normalise(p).get("datetime")
         if not new_dt:
-            await update.message.reply_text(
-                "Couldn't parse that time. Try `tomorrow 6pm` or `Friday 10am`."
-            )
+            await update.message.reply_text("Couldn't parse that time. Try `tomorrow 6pm` or `Friday 10am`.")
             return
         context.user_data["state"] = "idle"
         await _do_reschedule(update, event, new_dt)
         return
-
     if state == "clarifying":
-        # User answered the clarification — re-parse with original + answer combined
         original = context.user_data.pop("clarify_original", "")
         context.user_data["state"] = "idle"
         combined = f"{original} — {text}"
@@ -862,11 +1029,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Still not sure — try rephrasing or /help for examples.")
         return
 
-    # Try LLM first, but fall back to regex if LLM is unsure or unavailable
+    # Primary parsing: try LLM first, fall back to regex NLP
     llm_result = llm_client.parse(text)
     if llm_result:
         parsed = llm_client.normalise(llm_result)
-        # If LLM returned unknown/clarify, the regex parser does better
         if parsed["intent"] in ("unknown", "clarify"):
             parsed = nlp.parse_message(text)
     else:
@@ -917,14 +1083,24 @@ _DEADLINE_CLARIFICATION_RE = re.compile(
 )
 
 
-async def _add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    # Check if this looks like a deadline clarification for the last added task
+async def _add_task(update, context, parsed):
+    """Handle ``"add"`` intent — create one or more tasks.
+
+    Supports multi-task creation from sentences like ``"I have midterm Thursday
+    and assignment due Friday"``. Also supports deadline clarification
+    follow-ups where the user replies ``"deadline is Friday"`` after adding a
+    task without a deadline.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict from ``nlp.parse_message()`` or
+            ``llm.normalise()``.
+    """
     raw = parsed.get("raw", "")
     m   = _DEADLINE_CLARIFICATION_RE.match(raw.strip())
     last_task_id = context.user_data.get("last_added_task_id")
-
     if m and last_task_id:
-        # User is clarifying the deadline of the previous task
         task = db.get_task(last_task_id)
         if task and not task["deadline"]:
             dt = parsed.get("datetime")
@@ -937,12 +1113,9 @@ async def _add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: 
                 )
                 context.user_data.pop("last_added_task_id", None)
                 return
-
-    # Multi-task add: "I have midterm Thursday and assignment due Friday"
     titles    = parsed.get("titles")
     deadlines = parsed.get("deadlines")
     priority  = parsed.get("priority", "medium") or "medium"
-
     if titles and len(titles) > 1:
         added = []
         for i, t in enumerate(titles):
@@ -955,24 +1128,18 @@ async def _add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: 
             parse_mode="Markdown",
         )
         return
-
     title = (parsed.get("title") or "").strip()
     dt    = parsed.get("datetime")
-
     if not title or len(title) < 2:
         await update.message.reply_text("What's the task? E.g. `finish report by Friday`")
         return
-
     deadline_str = dt.date().isoformat() if dt else None
     task_id      = db.add_task(title=title, deadline=deadline_str, priority=priority)
     p_icon       = PRIORITY_ICON.get(priority, "🟡")
-
-    # Store for potential deadline clarification follow-up
     if not deadline_str:
         context.user_data["last_added_task_id"] = task_id
     else:
         context.user_data.pop("last_added_task_id", None)
-
     reply  = f"✅ *Task added!*\n\n{p_icon} *{title}*\n"
     reply += f"Due: {_fmt_deadline(deadline_str)}\n" if deadline_str else "No deadline set — reply `deadline is [date]` to add one\n"
     reply += f"Priority: {priority}\n"
@@ -983,7 +1150,17 @@ async def _add_task(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: 
 
 # ── LIST TASKS ─────────────────────────────────────────────────────────────────
 
-async def _list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
+
+async def _list_tasks(update, context, parsed):
+    """Handle ``"list"`` intent — display tasks filtered by time period.
+
+    Supports today, this week, next week, tomorrow, and all pending tasks.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
     text_lower = parsed["raw"].lower()
     if "today" in text_lower:
         today = datetime.now().date()
@@ -998,1562 +1175,975 @@ async def _list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed
     elif any(w in text_lower for w in ("this week", "week")):
         tasks  = db.get_tasks_this_week()
         header = "📆 *This Week's Tasks*"
+    elif "tomorrow" in text_lower:
+        today    = datetime.now().date()
+        tomorrow = today + timedelta(days=1)
+        tasks    = db.get_tasks_by_period(tomorrow, tomorrow)
+        header   = "📅 *Tomorrow's Tasks*"
     else:
-        tasks  = db.get_all_tasks(status="pending")
-        header = "📋 *All Pending Tasks*"
-
+        tasks   = db.get_unscheduled_tasks_sorted()
+        header  = "📋 *All Pending Tasks*"
     if not tasks:
-        await update.message.reply_text("No tasks found for that period 🎉")
+        await update.message.reply_text("✨ No tasks found — you're all clear!")
         return
-
     context.user_data["last_task_list"] = [dict(t) for t in tasks]
     await update.message.reply_text(
-        f"{header} ({len(tasks)})\n\n{_fmt_task_list(tasks)}\n\n"
-        "_Reply `schedule 1 2 3` to add to your calendar_",
+        f"{header}:\n\n{_fmt_task_list(tasks)}",
         parse_mode="Markdown",
     )
 
 
-# ── SCHEDULE TASKS (from task list) ───────────────────────────────────────────
+# ── SCHEDULE INTO CALENDAR ────────────────────────────────────────────────────
 
-async def _schedule_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    raw       = parsed["raw"]
-    numbers   = [int(n) for n in re.findall(r"\d+", raw)]
-    last_list = context.user_data.get("last_task_list", [])
 
-    if not last_list:
-        tasks = db.get_all_tasks(status="pending") + db.get_all_tasks(status="in_progress")
-        if not tasks:
-            await update.message.reply_text("No pending tasks to schedule!")
-            return
-        context.user_data["last_task_list"] = [dict(t) for t in tasks]
-        last_list = context.user_data["last_task_list"]
-        await update.message.reply_text(
-            f"📋 *Your Tasks*\n\n{_fmt_task_list(tasks)}\n\nWhich numbers to schedule?",
-            parse_mode="Markdown",
-        )
+async def _schedule_intent(update, context, parsed):
+    """Handle ``"schedule"`` intent — begin batch scheduling of tasks by index.
+
+    User sends ``"schedule 1 2 3"`` after a task list. This handler enters
+    the ``scheduling`` state and prompts for date/time for each task.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
+    raw  = parsed.get("raw", "")
+    nums = re.findall(r"\d+", raw)
+    if not nums:
+        await update.message.reply_text("Which tasks? E.g. `schedule 1 2`")
         return
-
-    if not numbers:
-        await update.message.reply_text("Tell me which tasks by number, e.g. `schedule 1 3`")
+    task_list = context.user_data.get("last_task_list", [])
+    if not task_list:
+        await update.message.reply_text("No recent task list. Try /tasks first.")
         return
-
-    task_ids = [
-        last_list[n - 1]["id"]
-        for n in numbers
-        if 1 <= n <= len(last_list)
-    ]
-    if not task_ids:
-        await update.message.reply_text("Those numbers don't match. Try /tasks first.")
+    indices = []
+    for n in nums:
+        i = int(n) - 1
+        if 0 <= i < len(task_list):
+            indices.append(i)
+    if not indices:
+        await update.message.reply_text("Task numbers not found in the last list.")
         return
-
-    context.user_data["state"]            = "scheduling"
+    task_ids = [task_list[i]["id"] for i in indices]
     context.user_data["pending_schedule"] = task_ids
     context.user_data["schedule_idx"]     = 0
+    context.user_data["state"]            = "scheduling"
     await _ask_schedule_time(update, context)
 
 
-async def _ask_schedule_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    idx      = context.user_data["schedule_idx"]
-    task_ids = context.user_data["pending_schedule"]
-    task     = db.get_task(task_ids[idx])
-    total    = len(task_ids)
-    duration = int(task["estimated_minutes"] or 60)
+async def _batch_schedule_intent(update, context, parsed):
+    """Handle ``"batch_schedule"`` intent — schedule tasks with datetime inline.
 
-    # Try smart suggestions
-    try:
-        free_slots = smart_schedule.get_free_slots(days_ahead=5, min_duration_min=duration)
-        msg, best  = smart_schedule.build_suggestion_message(task["title"], duration, free_slots)
-        header     = f"⏰ *Schedule {idx+1}/{total}* — _{task['title']}_\n\n"
-        context.user_data["schedule_suggested"] = best
-        await update.message.reply_text(header + msg, parse_mode="Markdown")
-    except Exception:
-        context.user_data["schedule_suggested"] = None
-        await update.message.reply_text(
-            f"⏰ *Schedule {idx+1}/{total}*\n\n"
-            f"Task: _{task['title']}_\n\n"
-            f"Estimated duration: {duration} min\n\n"
-            "When? (e.g. `Thursday 2pm for 2 hours remind me 40 mins before`)\n"
-            "_Type /cancel to stop._",
-            parse_mode="Markdown",
-        )
+    Similar to ``_schedule_intent`` but the user provided a datetime in the
+    same message (e.g. ``"schedule task 1 and 2 on Monday at 2pm"``).
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
+    await _schedule_intent(update, context, parsed)
 
 
-async def _scheduling_time(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+async def _ask_schedule_time(update, context):
+    """Prompt the user for a date/time for the current task being scheduled.
+
+    Called iteratively for each task in the pending schedule queue.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
     idx       = context.user_data["schedule_idx"]
     task_ids  = context.user_data["pending_schedule"]
-    task_id   = task_ids[idx]
-    task      = db.get_task(task_id)
-    suggested = context.user_data.get("schedule_suggested")
-
-    # Confirmed suggested slot
-    if suggested and text.lower().strip() in ("yes", "y", "yep", "sure", "ok", "confirm"):
-        dt = suggested["start"]
-    # Rejected — ask plainly
-    elif suggested and text.lower().strip() in ("no", "n", "nope"):
-        context.user_data["schedule_suggested"] = None
-        await update.message.reply_text(
-            f"When would you like to schedule _{task['title']}_?\n"
-            "(e.g. `Thursday 2pm to 4pm`)",
-            parse_mode="Markdown",
-        )
+    if idx >= len(task_ids):
+        context.user_data["state"] = "idle"
+        await update.message.reply_text("✅ All tasks scheduled!")
         return
-    # Numbered slot pick
-    elif re.match(r"^\d+$", text.strip()):
-        try:
-            task_duration = int(task["estimated_minutes"] or 60)
-            free_slots = smart_schedule.get_free_slots(days_ahead=5, min_duration_min=task_duration)
-            n = int(text.strip()) - 1
-            dt = free_slots[n]["start"] if 0 <= n < len(free_slots) else None
-        except Exception:
-            dt = None
-        if not dt:
-            dt = nlp.extract_datetime(text)
-    else:
-        dt = nlp.extract_datetime(text)
-
-    if not dt:
-        await update.message.reply_text("Couldn't parse that. Try `Thursday 2pm`, pick a number, or `yes` to confirm.")
+    task = db.get_task(task_ids[idx])
+    if not task:
+        context.user_data["schedule_idx"] = idx + 1
+        await _ask_schedule_time(update, context)
         return
+    title = task["title"]
+    context.user_data["scheduling_task_id"] = task["id"]
+    await update.message.reply_text(
+        f"⏰ Schedule {idx+1}/{len(task_ids)} — *{title}*\n\n"
+        "When? (e.g. `tomorrow 2pm`, `Thursday 10am`, or a duration like `2 hours`)",
+        parse_mode="Markdown",
+    )
 
-    duration  = nlp.extract_duration(text)
-    reminder  = nlp.compute_reminder_minutes(text, dt)
 
-    # If no duration given, enter end-time state
-    if not duration:
-        context.user_data["scheduling_start_dt"] = dt
-        context.user_data["scheduling_reminder"] = reminder
+async def _scheduling_time(update, context, text):
+    """Handle user's time input during the scheduling flow.
+
+    Parses the reply as either a duration or a datetime. If a duration is
+    detected, enters ``scheduling_end_time`` state to ask for the date.
+    If a datetime is detected, proceeds to confirmation.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        text: The user's reply text.
+    """
+    dur = nlp.extract_duration(text)
+    if dur:
+        context.user_data["scheduling_duration"] = dur
         context.user_data["state"] = "scheduling_end_time"
         await update.message.reply_text(
-            f"⏰ _{task['title']}_ at {_fmt_dt(dt)}\n\n"
-            "When does it finish? (e.g. `2pm`, `4:30 PM`, `in 2 hours`)",
-            parse_mode="Markdown",
+            f"Got it, {dur} minutes. What day/time? (e.g. `Thursday 2pm`)"
         )
         return
-
-    end_dt = dt + timedelta(minutes=duration)
-
-    # Confirmation step — ask before creating event
-    reply_lines = [
-        f"📅 *Confirm schedule:*\n",
-        f"*{task['title']}*\n"
-        f"📍 {_fmt_dt(dt)} → {end_dt.strftime('%I:%M %p')} ({duration} min)\n"
-        f"⏰ Reminder: {reminder} min before",
-    ]
-
-    recurrence = nlp.extract_recurrence(text)
-    if recurrence:
-        reply_lines.append(f"🔄 {recurrence['summary']}")
-
-    reply_lines.append("\nReply `yes` to confirm, `no` to skip.")
-
-    context.user_data["confirm_schedule"] = {
-        "type": "task",
-        "task_id": task_id,
-        "task_title": task["title"],
-        "dt": dt,
-        "duration": duration,
-        "reminder": reminder,
-        "end_dt": end_dt,
-        "recurrence_rrule": recurrence["rrule"] if recurrence else None,
-    }
-    context.user_data["state"] = "confirm_schedule"
-
-    await update.message.reply_text("\n".join(reply_lines), parse_mode="Markdown")
-
-
-async def _scheduling_end_time(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """User already gave a start time, now we need the end time."""
-    task_ids = context.user_data["pending_schedule"]
-    task_id  = task_ids[context.user_data["schedule_idx"]]
-    task     = db.get_task(task_id)
-    dt       = context.user_data["scheduling_start_dt"]
-    reminder = context.user_data.get("scheduling_reminder", 30)
-
-    end_dt = nlp.extract_datetime(text)
-    if not end_dt:
-        # Try parsing as a time-of-day (e.g. "2pm", "4:30 PM")
-        import pytz
-        tz = pytz.timezone(os.getenv("TIMEZONE", "Asia/Seoul"))
-        try:
-            parsed_time = datetime.strptime(text.strip(), "%I:%M %p")
-            parsed_time = datetime.strptime(text.strip().lstrip("0"), "%I:%M %p")
-        except ValueError:
-            try:
-                parsed_time = datetime.strptime(text.strip(), "%I %p")
-            except ValueError:
-                parsed_time = None
-        if parsed_time:
-            end_dt = dt.replace(hour=parsed_time.hour, minute=parsed_time.minute, second=0, microsecond=0)
-            if end_dt <= dt:
-                end_dt += timedelta(days=1)  # next day if end is before start
-        else:
-            # Try "in X hours/minutes"
-            dur = nlp.extract_duration(text)
-            if dur:
-                end_dt = dt + timedelta(minutes=dur)
-
-    if not end_dt or end_dt <= dt:
-        await update.message.reply_text(
-            "Couldn't parse that. Try a time like `2pm`, `4:30 PM`, `in 2 hours`, or /cancel.",
-        )
-        return
-
-    duration = int((end_dt - dt).total_seconds() / 60)
-    context.user_data.pop("scheduling_start_dt", None)
-    context.user_data.pop("scheduling_reminder", None)
-
-    reply_lines = [
-        f"📅 *Confirm schedule:*\n",
-        f"*{task['title']}*\n"
-        f"📍 {_fmt_dt(dt)} → {end_dt.strftime('%I:%M %p')} ({duration} min)\n"
-        f"⏰ Reminder: {reminder} min before",
-    ]
-    reply_lines.append("\nReply `yes` to confirm, `no` to skip.")
-
-    context.user_data["confirm_schedule"] = {
-        "type": "task",
-        "task_id": task_id,
-        "task_title": task["title"],
-        "dt": dt,
-        "duration": duration,
-        "reminder": reminder,
-        "end_dt": end_dt,
-    }
-    context.user_data["state"] = "confirm_schedule"
-    await update.message.reply_text("\n".join(reply_lines), parse_mode="Markdown")
-
-
-
-async def _confirm_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Handle confirmation/rejection of a scheduled event before creation."""
-    data = context.user_data.get("confirm_schedule")
-    if not data:
-        context.user_data["state"] = "idle"
-        await update.message.reply_text("⚠️ Nothing to confirm right now.")
-        return
-
-    raw = text.strip().lower()
-    if raw in ("no", "n", "nope", "cancel", "skip"):
-        context.user_data["state"] = "idle"
-        context.user_data.pop("confirm_schedule", None)
-
-        # If we were in batch scheduling (multi-task), move to next or finish
-        task_ids = context.user_data.get("pending_schedule", [])
-        if task_ids:
-            idx = context.user_data.get("schedule_idx", 0)
-            next_idx = idx + 1
-            if next_idx < len(task_ids):
-                context.user_data["schedule_idx"] = next_idx
-                await _ask_schedule_time(update, context)
-            else:
-                context.user_data["state"] = "idle"
-                context.user_data["pending_schedule"] = []
-                await update.message.reply_text("Scheduling cancelled for this task.")
-        else:
-            await update.message.reply_text("❌ Cancelled.")
-        return
-
-    if raw not in ("yes", "y", "yep", "sure", "ok", "confirm", "schedule"):
-        await update.message.reply_text("Reply `yes` to confirm or `no` to cancel.")
-        return
-
-    # Confirmed — create the event
-    task_id = data.get("task_id")
-    title = data.get("task_title", "Event")
-    dt = data["dt"]
-    duration = data["duration"]
-    reminder = data["reminder"]
-    end_dt = data["end_dt"]
-    rrule = data.get("recurrence_rrule")
-
-    try:
-        event_id = calendar_client.create_event(
-            title=title,
-            start=dt,
-            duration_minutes=duration,
-            reminder_minutes=reminder,
-            description=f"Scheduled via Planning Bot (task #{task_id})" if task_id else None,
-            rrule=rrule,
-        )
-
-        if task_id:
-            db.update_task(
-                task_id,
-                calendar_event_id=event_id,
-                scheduled_start=dt.isoformat(),
-                scheduled_end=end_dt.isoformat(),
-                status="in_progress",
-            )
-
-        recur_str = ""
-        if context.user_data.get("confirm_schedule", {}).get("recurrence_rrule"):
-            # Re-extract summary for display
-            rec = nlp.extract_recurrence(text)
-            if rec:
-                recur_str = f"\n🔁 {rec['summary'].capitalize()}"
-
-        await update.message.reply_text(
-            f"✅ *Scheduled!*\n\n"
-            f"*{title}*\n"
-            f"📍 {_fmt_dt(dt)} → {end_dt.strftime('%I:%M %p')} ({duration} min)"
-            f"{recur_str}\n"
-            f"⏰ Reminder: {reminder} min before",
-            parse_mode="Markdown",
-        )
-    except Exception as exc:
-        await update.message.reply_text(f"⚠️ Calendar error: {exc}")
-        context.user_data["state"] = "idle"
-        context.user_data.pop("confirm_schedule", None)
-        return
-
-    context.user_data["state"] = "idle"
-    context.user_data.pop("confirm_schedule", None)
-
-    # If we were in batch scheduling, move to the next task
-    task_ids = context.user_data.get("pending_schedule", [])
-    if task_ids:
-        idx = context.user_data.get("schedule_idx", 0)
-        next_idx = idx + 1
-        if next_idx < len(task_ids):
-            context.user_data["schedule_idx"] = next_idx
-            await _ask_schedule_time(update, context)
-        else:
-            context.user_data["pending_schedule"] = []
-            await update.message.reply_text("🎉 All tasks scheduled!")
-
-
-# ── DIRECT CALENDAR SCHEDULING (no task needed) ───────────────────────────────
-
-async def _schedule_direct_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    title       = parsed.get("title", "").strip()
-    dt          = parsed.get("datetime")
-    recurrence  = parsed.get("recurrence")
-    reminder    = parsed.get("reminder", 30)
-    duration    = parsed.get("duration", 60)
-    multi_slots = parsed.get("multi_slots")
-
-    if not title or len(title) < 2:
-        await update.message.reply_text(
-            "What do you want to schedule? E.g.\n"
-            "`schedule gym tuesday 10pm and friday 9am`\n"
-            "`schedule running session on Wednesday 9pm`"
-        )
-        return
-
-    # Multi-slot: create all events in one go
-    if multi_slots and len(multi_slots) >= 2:
-        # Check if any slot lacks a specific time — ask for clarification
-        had_times = getattr(multi_slots, "_had_times", None)
-        if had_times and not all(had_times):
-            # Find which slots lack times
-            slot_names = {0: "first", 1: "second", 2: "third", 3: "fourth"}
-            missing_info = []
-            for i, (s, has_time) in enumerate(zip(multi_slots, had_times)):
-                day_name = s.strftime("%A")
-                if not has_time:
-                    missing_info.append(f"  {slot_names.get(i, str(i+1))} ({day_name})")
-            context.user_data["state"]                 = "schedule_direct"
-            context.user_data["direct_title"]           = title
-            context.user_data["direct_recurrence"]      = recurrence
-            context.user_data["direct_reminder"]        = reminder
-            context.user_data["direct_duration"]        = duration
-            context.user_data["direct_multi_pending"]   = multi_slots
-            context.user_data["direct_multi_had_times"] = had_times
-            await update.message.reply_text(
-                f"⏰ I found multiple slots, but some need a specific time:\n\n"
-                + "\n".join(missing_info)
-                + "\n\nReply with the missing time, e.g. `first at 7pm` or `9pm` for the first one.",
-                parse_mode="Markdown",
-            )
-            return
-        await _do_multi_slot_schedule(update, title, multi_slots, duration, reminder)
-        return
-
-    # Single slot with time — confirm before creating
-    if dt:
-        end_dt = dt + timedelta(minutes=duration)
-        rrule = recurrence["rrule"] if recurrence else None
-        recur_str = f"\n🔁 {recurrence['summary'].capitalize()}" if recurrence else ""
-        context.user_data["confirm_schedule"] = {
-            "type": "direct",
-            "title": title,
-            "dt": dt,
-            "duration": duration,
-            "reminder": reminder,
-            "end_dt": end_dt,
-            "recurrence_rrule": rrule,
-            "recur_summary": recur_str,
-        }
-        context.user_data["state"] = "confirm_schedule"
-        reply_lines = [
-            f"📅 *Confirm schedule:*\n",
-            f"*{title}*\n"
-            f"📍 {_fmt_dt(dt)} → {end_dt.strftime('%I:%M %p')} ({duration} min)"
-            f"{recur_str}\n"
-            f"⏰ Reminder: {reminder} min before",
-        ]
-        reply_lines.append("\nReply `yes` to confirm, `no` to cancel.")
-        await update.message.reply_text("\n".join(reply_lines), parse_mode="Markdown")
-        return
-
-    # No time — use smart scheduling to suggest slots
-    context.user_data["state"]             = "schedule_direct"
-    context.user_data["direct_title"]      = title
-    context.user_data["direct_recurrence"] = recurrence
-    context.user_data["direct_reminder"]   = reminder
-    context.user_data["direct_duration"]   = duration
-    context.user_data["direct_suggested"]  = None
-
-    try:
-        free_slots = smart_schedule.get_free_slots(days_ahead=5, min_duration_min=duration)
-        msg, best  = smart_schedule.build_suggestion_message(title, duration, free_slots)
-        if best:
-            context.user_data["direct_suggested"] = best
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception:
-        recap = f"_{recurrence['summary']}_" if recurrence else "once"
-        await update.message.reply_text(
-            f"📅 Scheduling: *{title}* ({recap})\n\n"
-            "When? (e.g. `Wednesday 9pm for 1 hour` or `tuesday 10pm and friday 9am`)",
-            parse_mode="Markdown",
-        )
-
-
-async def _schedule_direct_time(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    title      = context.user_data.get("direct_title", "Event")
-    recurrence = context.user_data.get("direct_recurrence")
-    reminder   = nlp.compute_reminder_minutes(text, nlp.extract_datetime(text)) or context.user_data.get("direct_reminder", 30)
-    duration   = nlp.extract_duration(text) or context.user_data.get("direct_duration", 60)
-    suggested  = context.user_data.get("direct_suggested")
-
-    # User confirmed the suggested slot
-    if suggested and text.lower().strip() in ("yes", "y", "yep", "sure", "ok", "confirm"):
-        dt = suggested["start"]
-        end_dt = dt + timedelta(minutes=duration)
-        rrule = recurrence["rrule"] if recurrence else None
-        recur_str = f"\n🔁 {recurrence['summary'].capitalize()}" if recurrence else ""
-        context.user_data["confirm_schedule"] = {
-            "type": "direct",
-            "title": title,
-            "dt": dt,
-            "duration": duration,
-            "reminder": reminder,
-            "end_dt": end_dt,
-            "recurrence_rrule": rrule,
-            "recur_summary": recur_str,
-        }
-        ctx_text = f"{title} {_fmt_dt(dt)}"
-        context.user_data["state"] = "confirm_schedule"
-        reply_lines = [
-            f"📅 *Confirm schedule:*\n",
-            f"*{title}*\n"
-            f"📍 {_fmt_dt(dt)} → {end_dt.strftime('%I:%M %p')} ({duration} min)"
-            f"{recur_str}\n"
-            f"⏰ Reminder: {reminder} min before",
-        ]
-        reply_lines.append("\nReply `yes` to confirm, `no` to cancel.")
-        await update.message.reply_text("\n".join(reply_lines), parse_mode="Markdown")
-        return
-
-    # User said no — show more options
-    if suggested and text.lower().strip() in ("no", "n", "nope", "other", "other options"):
-        context.user_data["direct_suggested"] = None
-        try:
-            free_slots = smart_schedule.get_free_slots(days_ahead=7, min_duration_min=duration)
-            slots_text = smart_schedule.format_slots_for_display(free_slots, limit=6)
-            await update.message.reply_text(
-                f"📅 Here are your free slots for *{title}*:\n\n{slots_text}\n\n"
-                "Reply with a number or type a specific time.",
-                parse_mode="Markdown",
-            )
-        except Exception:
-            await update.message.reply_text("When would you like to schedule it?")
-        return
-
-    # User picked a numbered slot from the list
-    if re.match(r"^\d+$", text.strip()):
-        try:
-            free_slots = smart_schedule.get_free_slots(days_ahead=7, min_duration_min=duration)
-            n = int(text.strip()) - 1
-            if 0 <= n < len(free_slots):
-                dt = free_slots[n]["start"]
-                end_dt = dt + timedelta(minutes=duration)
-                rrule = recurrence["rrule"] if recurrence else None
-                recur_str = f"\n🔁 {recurrence['summary'].capitalize()}" if recurrence else ""
-                context.user_data["confirm_schedule"] = {
-                    "type": "direct",
-                    "title": title,
-                    "dt": dt,
-                    "duration": duration,
-                    "reminder": reminder,
-                    "end_dt": end_dt,
-                    "recurrence_rrule": rrule,
-                    "recur_summary": recur_str,
-                }
-                context.user_data["state"] = "confirm_schedule"
-                reply_lines = [
-                    f"📅 *Confirm schedule:*\n",
-                    f"*{title}*\n"
-                    f"📍 {_fmt_dt(dt)} → {end_dt.strftime('%I:%M %p')} ({duration} min)"
-                    f"{recur_str}\n"
-                    f"⏰ Reminder: {reminder} min before",
-                ]
-                reply_lines.append("\nReply `yes` to confirm, `no` to cancel.")
-                await update.message.reply_text("\n".join(reply_lines), parse_mode="Markdown")
-                return
-        except Exception:
-            pass
-
-    # Check for multi-slot reply
-    multi_slots = nlp.extract_multi_slots(text)
-    if multi_slots and len(multi_slots) >= 2:
-        context.user_data["state"] = "idle"
-        await _do_multi_slot_schedule(update, title, multi_slots, duration, reminder)
-        return
-
     dt = nlp.extract_datetime(text)
     if not dt:
-        await update.message.reply_text(
-            "Couldn't parse that. Try `Wednesday 9pm`, pick a slot number, or reply `yes` to confirm the suggestion."
-        )
+        await update.message.reply_text("Couldn't parse that. Try `tomorrow 2pm` or `2 hours`.")
         return
-
-    end_dt = dt + timedelta(minutes=duration)
-    rrule = recurrence["rrule"] if recurrence else None
-    recur_str = f"\n🔁 {recurrence['summary'].capitalize()}" if recurrence else ""
-    context.user_data["confirm_schedule"] = {
-        "type": "direct",
-        "title": title,
-        "dt": dt,
-        "duration": duration,
-        "reminder": reminder,
-        "end_dt": end_dt,
-        "recurrence_rrule": rrule,
-        "recur_summary": recur_str,
-    }
+    context.user_data["scheduling_dt"] = dt
     context.user_data["state"] = "confirm_schedule"
-    reply_lines = [
-        f"📅 *Confirm schedule:*\n",
-        f"*{title}*\n"
-        f"📍 {_fmt_dt(dt)} → {end_dt.strftime('%I:%M %p')} ({duration} min)"
-        f"{recur_str}\n"
-        f"⏰ Reminder: {reminder} min before",
-    ]
-    reply_lines.append("\nReply `yes` to confirm, `no` to cancel.")
-    await update.message.reply_text("\n".join(reply_lines), parse_mode="Markdown")
+    await _show_schedule_confirm(update, context)
 
 
-async def _do_multi_slot_schedule(update, title, slots, duration, reminder):
-    """Create one calendar event per slot, confirm all at once."""
-    lines    = [f"✅ *Scheduled {len(slots)} sessions:*\n\n*{title}*\n"]
-    errors   = []
+async def _scheduling_end_time(update, context, text):
+    """Handle user's date input after they provided a duration.
 
-    for dt in slots:
-        end_dt = dt + timedelta(minutes=duration)
-        try:
-            calendar_client.create_event(
-                title            = title,
-                start            = dt,
-                duration_minutes = duration,
-                reminder_minutes = reminder,
-            )
-            lines.append(f"  • {_fmt_dt(dt)} → {end_dt.strftime('%I:%M %p')}")
-        except Exception as exc:
-            errors.append(f"{_fmt_dt(dt)}: {exc}")
-
-    lines.append(f"\n⏰ Reminder: {reminder} min before each")
-    if errors:
-        lines.append("\n⚠️ Failed:\n" + "\n".join(errors))
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def _do_direct_schedule(update, title, dt, duration, reminder, recurrence):
-    """Directly create a calendar event (no confirmation) — used by _do_multi_slot_schedule only."""
-    end_dt = dt + timedelta(minutes=duration)
-    try:
-        rrule = recurrence["rrule"] if recurrence else None
-        calendar_client.create_event(
-            title=title,
-            start=dt,
-            duration_minutes=duration,
-            reminder_minutes=reminder,
-            rrule=rrule,
-        )
-        recur_str = f"\n🔁 {recurrence['summary'].capitalize()}" if recurrence else ""
-        await update.message.reply_text(
-            f"✅ *Scheduled!*\n\n"
-            f"*{title}*\n"
-            f"{_fmt_dt(dt)} → {end_dt.strftime('%I:%M %p')}"
-            f"{recur_str}\n"
-            f"⏰ Reminder: {reminder} min before",
-            parse_mode="Markdown",
-        )
-    except Exception as exc:
-        await update.message.reply_text(f"⚠️ Calendar error: {exc}")
-
-
-# ── BATCH SCHEDULE (schedule multiple tasks at multiple slots in one message) ──
-
-_BATCH_SCHEDULE_RE = re.compile(
-    r"(?:schedule|plan|block|add)\s+"
-    r"(?:task\s+)?(\d+)\s+"
-    r"(?:on\s+|at\s+)?"
-    r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun|tomorrow|today)"
-    r"(?:\s+(?:at\s+|from\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?))?"
-    r"(?:\s+(?:for|and)\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?))?"
-    r"(?:\s+(?:and|,)\s+task\s+(\d+)\s+"
-    r"(?:on\s+|at\s+)?"
-    r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun|tomorrow|today)"
-    r"(?:\s+(?:at\s+|from\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?))?"
-    r"(?:\s+(?:for|to|and)\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?))?"
-    r")?",
-    re.IGNORECASE,
-)
-
-
-async def _batch_schedule_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        text: The user's reply text.
     """
-    Handle "schedule task 1 on monday at 3pm for 1.5 hours and task 2 on thursday from 9 am to 11am"
-    Parses tasks from the last task list and creates calendar events for each.
-    """
-    raw = parsed.get("raw", "").lower()
-    last_list = context.user_data.get("last_task_list", [])
-
-    if not last_list:
-        # Fetch unscheduled tasks if no list cached
-        tasks = db.get_unscheduled_tasks_sorted()
-        if not tasks:
-            await update.message.reply_text("No unscheduled tasks to schedule.")
-            return
-        context.user_data["last_task_list"] = [dict(t) for t in tasks]
-        last_list = context.user_data["last_task_list"]
-
-    # Parse multi-task, multi-slot format
-    # Pattern: "schedule task X on DAY at TIME for DURATION and task Y on DAY at TIME for DURATION"
-    # First extract task numbers and their corresponding slots
-    task_assignments = []  # list of (task_number, day_name, time_str, duration_minutes)
-
-    # Find all "task <num>" patterns and their associated slot info
-    segments = re.split(r"\b(?:and|,)\s*(?=task\s+\d)", raw, flags=re.IGNORECASE)
-    for seg in segments:
-        m = re.match(
-            r"\s*(?:schedule|plan|block|add)?\s*(?:task\s+)?(\d+)\s*"
-            r"(?:on\s+|at\s+)?"
-            r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun|tomorrow|today)"
-            r"(?:\s+(?:at\s+|from\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?))?"
-            r"(?:\s+(?:for|and|to)\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?))?"
-            r"(?:\s+(?:and|to)\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?))?",
-            seg.strip(), re.IGNORECASE
-        )
-        if m:
-            task_num = int(m.group(1))
-            day_name = m.group(2)
-            time_str = m.group(3)
-            dur1_val = m.group(4)
-            dur1_unit = m.group(5)
-            dur2_val = m.group(6)
-            dur2_unit = m.group(7)
-
-            # Calculate duration
-            if dur2_val:
-                duration = float(dur2_val)
-                duration = int(duration * 60) if dur2_unit and ("hour" in dur2_unit or "hr" in dur2_unit) else int(duration)
-            elif dur1_val:
-                duration = float(dur1_val)
-                duration = int(duration * 60) if dur1_unit and ("hour" in dur1_unit or "hr" in dur1_unit) else int(duration)
-            else:
-                duration = 60
-
-            task_assignments.append((task_num, day_name, time_str, duration))
-
-    if not task_assignments:
-        # Fallback: try simpler parsing
-        await update.message.reply_text(
-            "Couldn't parse that. Try:\n"
-            "`schedule task 1 on monday at 3pm for 1.5 hours and task 2 on thursday 9am for 2 hours`"
-        )
+    dt = nlp.extract_datetime(text)
+    if not dt:
+        await update.message.reply_text("Couldn't parse that. Try `Thursday 2pm`.")
         return
+    context.user_data["scheduling_dt"] = dt
+    context.user_data["state"] = "confirm_schedule"
+    await _show_schedule_confirm(update, context)
 
-    scheduled = []
-    errors = []
 
-    for task_num, day_name, time_str, duration in task_assignments:
-        if task_num < 1 or task_num > len(last_list):
-            errors.append(f"Task #{task_num} not found in list.")
-            continue
+async def _show_schedule_confirm(update, context):
+    """Show a schedule confirmation message with proposed time and duration.
 
-        task = db.get_task(last_list[task_num - 1]["id"])
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+    """
+    task_id = context.user_data.get("scheduling_task_id")
+    task = db.get_task(task_id)
+    if not task:
+        await update.message.reply_text("Task not found. Starting over.")
+        context.user_data["state"] = "idle"
+        return
+    dt   = context.user_data.get("scheduling_dt")
+    dur  = context.user_data.get("scheduling_duration") or task.get("estimated_minutes", 60)
+    end  = dt + timedelta(minutes=dur)
+    reminder_min = nlp.extract_reminder_minutes(task.get("title", ""))
+    await update.message.reply_text(
+        f"📅 *Confirm schedule:*\n"
+        f"*{task['title']}*\n"
+        f"📍 {_fmt_dt(dt)} → {end.strftime('%I:%M %p')} ({dur} min)\n"
+        f"⏰ Reminder: {reminder_min} min before\n\n"
+        "Reply `yes` to confirm, `no` to skip, or a different time.",
+        parse_mode="Markdown",
+    )
+
+
+async def _confirm_schedule(update, context, text):
+    """Handle user's confirmation reply after a schedule proposal.
+
+    On ``"yes"``: creates the calendar event, updates the task's
+    ``calendar_event_id`` and timestamps, then moves to the next task.
+    On ``"no"``: skips the current task and proceeds to the next.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        text: The user's reply text.
+    """
+    text_lower = text.lower().strip()
+    if text_lower in ("yes", "y", "ok", "✅"):
+        task_id = context.user_data.get("scheduling_task_id")
+        task = db.get_task(task_id)
         if not task:
-            errors.append(f"Task #{task_num} no longer exists.")
-            continue
-
-        # Build a datetime string from the day and time
-        time_query = f"{day_name} {time_str}".strip() if time_str else day_name
-        dt = nlp.extract_datetime(time_query)
-        if not dt:
-            errors.append(f"Couldn't parse time for task #{task_num}: '{time_query}'")
-            continue
-
-        end_dt = dt + timedelta(minutes=duration)
-
+            await update.message.reply_text("Task not found.")
+            context.user_data["state"] = "idle"
+            return
+        dt   = context.user_data.get("scheduling_dt")
+        dur  = context.user_data.get("scheduling_duration") or task.get("estimated_minutes", 60)
+        reminder_min = nlp.extract_reminder_minutes(task.get("title", ""))
         try:
-            event_id = calendar_client.create_event(
-                title=task["title"],
-                start=dt,
-                duration_minutes=duration,
-                reminder_minutes=30,
-                description=f"Scheduled via Planning Bot (task #{task['id']})",
-            )
-            db.update_task(
-                task["id"],
+            event_id = calendar_client.create_event(task["title"], dt, dur, reminder_minutes=reminder_min)
+            end = dt + timedelta(minutes=dur)
+            db.update_task(task["id"],
                 calendar_event_id=event_id,
                 scheduled_start=dt.isoformat(),
-                scheduled_end=end_dt.isoformat(),
-                status="in_progress",
-            )
-            scheduled.append(f"• *{task['title']}* — {_fmt_dt(dt)} → {end_dt.strftime('%I:%M %p')}")
-        except Exception as exc:
-            errors.append(f"• {task['title']}: {exc}")
-
-    if scheduled:
-        msg = "✅ *Tasks scheduled!*\n\n" + "\n".join(scheduled)
-        if errors:
-            msg += "\n\n⚠️ *Errors:*\n" + "\n".join(errors)
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(
-            "Couldn't schedule those tasks:\n" + "\n".join(errors)
-        )
-
-
-# ── FREE TIME / TASK PLANNING ─────────────────────────────────────────────────
-
-async def _free_time_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    duration = int(parsed.get("duration") or 60)
-    raw      = parsed.get("raw", "").lower()
-    days     = 2 if "tomorrow" in raw else 1 if "today" in raw else 7 if "week" in raw else 5
-
-    try:
-        slots = smart_schedule.get_free_slots(days_ahead=days, min_duration_min=duration)
-    except Exception as exc:
-        await update.message.reply_text(f"⚠️ Couldn't read calendar: {exc}")
-        return
-
-    if "tomorrow" in raw:
-        import pytz
-        tz = pytz.timezone(os.getenv("TIMEZONE", "Asia/Seoul"))
-        tomorrow = datetime.now(tz).date() + timedelta(days=1)
-        slots = [s for s in slots if s["start"].date() == tomorrow]
-
-    if not slots:
-        await update.message.reply_text(f"I couldn't find a free {duration}-minute block in that window.")
-        return
-
-    await update.message.reply_text(
-        f"🕰 *Free {duration}+ min blocks*\n\n"
-        f"{smart_schedule.format_slots_for_display(slots, limit=8)}\n\n"
-        "_Try `plan my unscheduled tasks` if you want me to match tasks to these._",
-        parse_mode="Markdown",
-    )
-
-
-async def _plan_tasks_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    tasks = [dict(t) for t in db.get_plannable_tasks(limit=12)]
-    if not tasks:
-        await update.message.reply_text("No unscheduled tasks to plan right now.")
-        return
-
-    min_duration = min(max(int(t.get("estimated_minutes") or 60), 30) for t in tasks)
-    try:
-        slots = smart_schedule.get_free_slots(days_ahead=7, min_duration_min=min_duration)
-    except Exception as exc:
-        await update.message.reply_text(f"⚠️ Couldn't read calendar: {exc}")
-        return
-
-    plan = smart_schedule.build_task_plan(tasks, slots, limit=6)
-    if not plan:
-        await update.message.reply_text(
-            "I found unscheduled tasks, but no free blocks long enough this week.\n"
-            "Try adding shorter estimates or asking for free time first."
-        )
-        return
-
-    context.user_data["state"] = "plan_confirm"
-    context.user_data["pending_plan"] = [
-        {
-            "task_id": item["task"]["id"],
-            "title": item["task"]["title"],
-            "start": item["start"].isoformat(),
-            "end": item["end"].isoformat(),
-            "duration": int((item["end"] - item["start"]).total_seconds() / 60),
-        }
-        for item in plan
-    ]
-
-    await update.message.reply_text(
-        "🧠 *Suggested task plan*\n\n"
-        f"{smart_schedule.format_task_plan(plan)}\n\n"
-        "_Reply `yes` to schedule all, `schedule 1 3` for selected items, or `no` to leave them unscheduled._",
-        parse_mode="Markdown",
-    )
-
-
-async def _plan_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    plan = context.user_data.get("pending_plan", [])
-    raw = text.strip().lower()
-
-    if raw in ("no", "n", "cancel", "stop"):
-        context.user_data["state"] = "idle"
-        context.user_data.pop("pending_plan", None)
-        await update.message.reply_text("No problem. I left those tasks unscheduled.")
-        return
-
-    if raw in ("yes", "y", "ok", "confirm", "schedule all"):
-        indexes = list(range(len(plan)))
-    else:
-        indexes = [int(n) - 1 for n in re.findall(r"\d+", raw)]
-
-    indexes = [i for i in indexes if 0 <= i < len(plan)]
-    if not indexes:
-        await update.message.reply_text(
-            "Reply `yes` to schedule all, `schedule 1 3` for selected items, or `no` to skip."
-        )
-        return
-
-    scheduled = []
-    errors = []
-    for i in indexes:
-        item = plan[i]
-        task = db.get_task(item["task_id"])
-        if not task:
-            errors.append(f"{i+1}. Task no longer exists")
-            continue
-
-        start = datetime.fromisoformat(item["start"])
-        end = datetime.fromisoformat(item["end"])
-        duration = item["duration"]
-
-        try:
-            event_id = calendar_client.create_event(
-                title=task["title"],
-                start=start,
-                duration_minutes=duration,
-                reminder_minutes=30,
-                description=f"Scheduled via Planning Bot (task #{task['id']})",
-            )
-            db.update_task(
-                task["id"],
-                calendar_event_id=event_id,
-                scheduled_start=start.isoformat(),
                 scheduled_end=end.isoformat(),
                 status="in_progress",
             )
-            scheduled.append(f"{i+1}. {task['title']} — {_fmt_dt(start)} → {end.strftime('%I:%M %p')}")
+            await update.message.reply_text(
+                f"✅ *Scheduled!*\n"
+                f"*{task['title']}*\n"
+                f"📍 {_fmt_dt(dt)} → {end.strftime('%I:%M %p')} ({dur} min)\n"
+                f"⏰ Reminder: {reminder_min} min before"
+                f"{_entity_ref_line('task', task['id'])}",
+                parse_mode="Markdown",
+            )
         except Exception as exc:
-            errors.append(f"{i+1}. {task['title']}: {exc}")
+            await update.message.reply_text(f"⚠️ Couldn't create calendar event: {exc}")
+        context.user_data["schedule_idx"] = context.user_data.get("schedule_idx", 0) + 1
+        context.user_data["state"] = "scheduling"
+        await _ask_schedule_time(update, context)
+    else:
+        await update.message.reply_text("Skipped.")
+        context.user_data.pop("scheduling_dt", None)
+        context.user_data.pop("scheduling_duration", None)
+        context.user_data["schedule_idx"] = context.user_data.get("schedule_idx", 0) + 1
+        context.user_data["state"] = "scheduling"
+        await _ask_schedule_time(update, context)
 
-    context.user_data["state"] = "idle"
-    context.user_data.pop("pending_plan", None)
 
-    if scheduled:
-        msg = "✅ *Scheduled from plan:*\n\n" + "\n".join(scheduled)
-        if errors:
-            msg += "\n\n⚠️ *Failed:*\n" + "\n".join(errors)
+# ── SCHEDULE DIRECT ────────────────────────────────────────────────────────────
+
+
+async def _schedule_direct_intent(update, context, parsed):
+    """Handle ``"schedule_direct"`` intent — schedule a direct calendar event.
+
+    If a datetime was provided in the message, enters ``confirm_schedule``
+    state. Otherwise, queries free slots and suggests the best one.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
+    title = parsed.get("title", "").strip() or "Event"
+    dt    = parsed.get("datetime")
+    dur   = parsed.get("duration") or 60
+    context.user_data["scheduling_direct"] = {"title": title, "duration": dur}
+    if dt:
+        # User provided time inline — create the event directly, no confirmation needed
+        try:
+            event_id = calendar_client.create_event(title, dt, dur)
+            end = dt + timedelta(minutes=dur)
+            reminder_min = nlp.extract_reminder_minutes(title)
+            await update.message.reply_text(
+                f"✅ *Scheduled!*\n*{title}*\n"
+                f"📍 {_fmt_dt(dt)} → {end.strftime('%I:%M %p')} ({dur} min)\n"
+                f"⏰ Reminder: {reminder_min} min before"
+                f"{_entity_ref_line('cal_event', event_id)}",
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            await update.message.reply_text(f"⚠️ Couldn't create calendar event: {exc}")
+        return
+    else:
+        free = smart_schedule.get_free_slots()
+        msg, best = smart_schedule.build_suggestion_message(title, dur, free)
+        context.user_data["state"] = "schedule_direct"
         await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def _schedule_direct_time(update, context, text):
+    """Handle user's time input for a direct calendar event (no task).
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        text: The user's reply text.
+    """
+    text_lower = text.lower().strip()
+    if text_lower in ("yes", "y", "ok", "✅"):
+        direct = context.user_data.get("scheduling_direct", {})
+        title  = direct.get("title", "Event")
+        dur    = direct.get("duration", 60)
+        free   = smart_schedule.get_free_slots()
+        best   = smart_schedule.suggest_slot(title, dur, free)
+        if best:
+            dt = best["start"]
+            try:
+                event_id = calendar_client.create_event(title, dt, dur)
+                end = dt + timedelta(minutes=dur)
+                await update.message.reply_text(
+                    f"✅ *Scheduled!*\n*{title}*\n📍 {_fmt_dt(dt)} → {end.strftime('%I:%M %p')} ({dur} min)"
+                    f"{_entity_ref_line('cal_event', event_id)}",
+                    parse_mode="Markdown",
+                )
+            except Exception as exc:
+                await update.message.reply_text(f"⚠️ Couldn't create event: {exc}")
+        else:
+            await update.message.reply_text("No suitable free slots found.")
+        context.user_data["state"] = "idle"
     else:
-        await update.message.reply_text("I couldn't schedule those items:\n" + "\n".join(errors))
+        dt = nlp.extract_datetime(text)
+        if not dt:
+            await update.message.reply_text("Couldn't parse that. Try `tomorrow 2pm`.")
+            return
+        direct = context.user_data.get("scheduling_direct", {})
+        title  = direct.get("title", "Event")
+        dur    = direct.get("duration", 60)
+        try:
+            event_id = calendar_client.create_event(title, dt, dur)
+            end = dt + timedelta(minutes=dur)
+            await update.message.reply_text(
+                f"✅ *Scheduled!*\n*{title}*\n📍 {_fmt_dt(dt)} → {end.strftime('%I:%M %p')} ({dur} min)"
+                f"{_entity_ref_line('cal_event', event_id)}",
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            await update.message.reply_text(f"⚠️ Couldn't create event: {exc}")
+        context.user_data["state"] = "idle"
 
 
-# ── COMPLETE ───────────────────────────────────────────────────────────────────
+# ── COMPLETE TASKS ─────────────────────────────────────────────────────────────
 
-async def _complete_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    numbers   = [int(n) for n in re.findall(r"\d+", parsed["raw"])]
-    last_list = context.user_data.get("last_task_list", [])
 
-    if not numbers:
-        await update.message.reply_text("Which task? E.g. `mark task 2 done` or `done 1 3`")
+async def _complete_intent(update, context, parsed):
+    """Handle ``"complete"`` intent — mark one or more tasks as done.
+
+    Supports ``"done 1 2"`` (by list index) and ``"mark task 1 done"``
+    (by task ID). Each completion includes an inline undo button.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
+    raw     = parsed.get("raw", "")
+    task_id = parsed.get("task_id")
+    # Try list indices first
+    nums = re.findall(r"\bdone\s+(\d+)|\b(\d+)\s+done|^(\d+)$", raw, re.IGNORECASE)
+    flat = [int(x) for t in nums for x in t if x]
+    if flat:
+        task_list = context.user_data.get("last_task_list", [])
+        for n in flat:
+            i = n - 1
+            if 0 <= i < len(task_list):
+                tid = task_list[i]["id"]
+                db.complete_task(tid)
+                task = db.get_task(tid)
+                title = task["title"] if task else "Task"
+                keyboard = [[InlineKeyboardButton("↩️ Undo", callback_data=f"undo_{tid}")]]
+                await update.message.reply_text(
+                    f"✅ *{title}* completed!",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
         return
+    # Fallback: try numeric task_id
+    nums = re.findall(r"\d+", raw)
+    if nums:
+        tid = int(nums[0])
+        db.complete_task(tid)
+        keyboard = [[InlineKeyboardButton("↩️ Undo", callback_data=f"undo_{tid}")]]
+        await update.message.reply_text(
+            f"✅ Task #{tid} completed!",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+    await update.message.reply_text("Which task? E.g. `done 1`, `mark task 1 done`")
 
-    completed = []
-    for n in numbers:
-        task_id = last_list[n - 1]["id"] if (last_list and 1 <= n <= len(last_list)) else n
-        task    = db.get_task(task_id)
-        if task:
-            db.complete_task(task_id)
-            completed.append(task)
 
-    if completed:
-        text_lines = ["✅ *Done!*"]
-        reply_markup = None
-        for task in completed:
-            text_lines.append(f"• *{task['title']}*")
-            if task["deadline"]:
-                text_lines[-1] += f" (due {_fmt_deadline(task['deadline'])})"
-        if len(completed) == 1:
-            # Single task — add undo button
-            text_lines.append("\n↩️ Undo within 30 seconds:")
-            reply_markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"↩️ Undo: {completed[0]['title'][:25]}", callback_data=f"undo_task_{completed[0]['id']}")]
-            ])
-        await update.message.reply_text("\n".join(text_lines), parse_mode="Markdown", reply_markup=reply_markup)
+# ── DELETE TASKS ───────────────────────────────────────────────────────────────
+
+
+async def _delete_intent(update, context, parsed):
+    """Handle ``"delete"`` intent — enter deletion confirmation flow.
+
+    Supports ``"delete task 2"`` (by ID) and ``"delete 1"`` (by list index).
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
+    raw = parsed.get("raw", "")
+    nums = re.findall(r"\bdelete\s+(?:task\s+)?(\d+)", raw, re.IGNORECASE)
+    if nums:
+        task_id = int(nums[0])
+        context.user_data["pending_delete"] = task_id
+        context.user_data["state"] = "deleting"
+        task = db.get_task(task_id)
+        title = task["title"] if task else "this task"
+        await update.message.reply_text(
+            f"🗑 Delete *{title}*?\n\nReply `yes` to confirm, `no` to cancel.",
+            parse_mode="Markdown",
+        )
     else:
-        await update.message.reply_text("Couldn't find those tasks. Try /tasks first.")
+        # Try list indices
+        nums2 = re.findall(r"\bdelete\s+(\d+)", raw, re.IGNORECASE)
+        if nums2:
+            n = int(nums2[0]) - 1
+            task_list = context.user_data.get("last_task_list", [])
+            if 0 <= n < len(task_list):
+                task_id = task_list[n]["id"]
+                context.user_data["pending_delete"] = task_id
+                context.user_data["state"] = "deleting"
+                task = db.get_task(task_id)
+                title = task["title"] if task else "this task"
+                await update.message.reply_text(
+                    f"🗑 Delete *{title}*?\n\nReply `yes` to confirm, `no` to cancel.",
+                    parse_mode="Markdown",
+                )
+                return
+        await update.message.reply_text("Which task? E.g. `delete task 2` or `delete 1`")
 
 
-# ── DELETE ─────────────────────────────────────────────────────────────────────
+async def _delete_confirm(update, context, text):
+    """Handle user's confirmation reply for deletion.
 
-async def _delete_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    numbers   = [int(n) for n in re.findall(r"\d+", parsed["raw"])]
-    last_list = context.user_data.get("last_task_list", [])
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        text: The user's reply text.
+    """
+    if text.lower().strip() in ("yes", "y", "ok", "✅"):
+        task_id = context.user_data.pop("pending_delete", None)
+        if task_id:
+            task = db.delete_task(task_id)
+            if task:
+                await update.message.reply_text(f"🗑 Deleted *{task['title']}*", parse_mode="Markdown")
+            else:
+                await update.message.reply_text("Task not found.")
+    else:
+        await update.message.reply_text("Cancelled.")
+    context.user_data["state"] = "idle"
 
-    if not numbers:
-        await update.message.reply_text("Which task to delete? E.g. `delete task 2`")
+
+# ── UPDATE TASKS ───────────────────────────────────────────────────────────────
+
+
+async def _update_intent(update, context, parsed):
+    """Handle ``"update"`` intent — enter interactive update flow for a task.
+
+    Supports ``"update task 1 deadline to Monday"`` — the deadline is parsed
+    immediately. Otherwise enters ``updating`` state to collect the new value.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
+    raw = parsed.get("raw", "")
+    m   = re.search(r"update\s+(?:task\s+)?(\d+)", raw, re.IGNORECASE)
+    if not m:
+        await update.message.reply_text("Which task? E.g. `update task 1 deadline to Monday`")
         return
-
-    n       = numbers[0]
-    task_id = last_list[n - 1]["id"] if (last_list and 1 <= n <= len(last_list)) else n
-    task    = db.get_task(task_id)
-
+    task_id = int(m.group(1))
+    task = db.get_task(task_id)
     if not task:
-        await update.message.reply_text(f"Task #{task_id} not found.")
+        await update.message.reply_text("Task not found.")
         return
-
-    context.user_data["state"]             = "deleting"
-    context.user_data["pending_delete_id"] = task_id
-    cal_note = " and remove from Google Calendar" if task["calendar_event_id"] else ""
+    # Try to extract a new deadline directly
+    dt = parsed.get("datetime")
+    if dt:
+        db.update_task(task_id, deadline=dt.date().isoformat())
+        await update.message.reply_text(
+            f"✏️ Updated deadline for *{task['title']}*: {_fmt_deadline(dt.date().isoformat())}"
+            f"{_entity_ref_line('task', task_id)}",
+            parse_mode="Markdown",
+        )
+        return
+    context.user_data["pending_update"] = {"task_id": task_id, "field": "deadline"}
+    context.user_data["state"] = "updating"
     await update.message.reply_text(
-        f"🗑 Delete *{task['title']}*{cal_note}?\n\nReply `yes` to confirm.",
+        f"✏️ *{task['title']}*\nNew deadline? (e.g. `Friday`, `next Monday`)",
         parse_mode="Markdown",
     )
 
 
-async def _delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    if text.lower() in ("yes", "y", "yep", "sure", "confirm", "delete"):
-        task_id = context.user_data.get("pending_delete_id")
-        task    = db.delete_task(task_id)
-        if task and task["calendar_event_id"]:
-            try:
-                calendar_client.delete_event(task["calendar_event_id"])
-                msg = f"🗑 Deleted *{task['title']}* and removed from calendar."
-            except Exception:
-                msg = f"🗑 Deleted *{task['title']}* (calendar removal failed)."
-        else:
-            msg = f"🗑 Deleted *{task['title'] if task else 'task'}*."
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    else:
-        await update.message.reply_text("❌ Deletion cancelled.")
+async def _update_value(update, context, text):
+    """Handle user's new value input during the update flow.
 
-    context.user_data["state"] = "idle"
-    context.user_data.pop("pending_delete_id", None)
-
-
-# ── REPLY-BASED DELETE CONFIRM ───────────────────────────────────────────────
-
-async def _reply_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Handle confirmation of a reply-based delete request."""
-    data = context.user_data.get("reply_delete")
-    if not data:
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        text: The user's reply text.
+    """
+    pending = context.user_data.get("pending_update", {})
+    task_id = pending.get("task_id")
+    field   = pending.get("field", "deadline")
+    if not task_id:
+        await update.message.reply_text("No pending update.")
         context.user_data["state"] = "idle"
-        await update.message.reply_text("⚠️ Nothing to delete right now.")
         return
-
-    text_lower = text.strip().lower()
-    if text_lower not in ("yes", "y", "yep", "sure", "confirm", "delete"):
-        context.user_data["state"] = "idle"
-        context.user_data.pop("reply_delete", None)
-        await update.message.reply_text("❌ Deletion cancelled.")
-        return
-
-    entity_type = data["entity_type"]
-    entity_id = data["entity_id"]
-
-    try:
-        if entity_type == "task":
-            task = db.delete_task(int(entity_id))
-            if task and task["calendar_event_id"]:
-                try:
-                    calendar_client.delete_event(task["calendar_event_id"])
-                except Exception:
-                    pass
-            title = task["title"] if task else "Task"
-            await update.message.reply_text(f"🗑 Deleted task: *{title}*", parse_mode="Markdown")
-
-        elif entity_type == "reminder":
-            reminder = db.delete_reminder(int(entity_id))
-            title = reminder["title"] if reminder else "Reminder"
-            await update.message.reply_text(f"🗑 Deleted reminder: *{title}*", parse_mode="Markdown")
-
-        elif entity_type == "cal_event":
-            # Delete from Google Calendar
-            try:
-                calendar_client.delete_event(entity_id)
-                await update.message.reply_text("🗑 Deleted calendar event.")
-            except Exception as exc:
-                await update.message.reply_text(f"⚠️ Couldn't delete calendar event: {exc}")
-
-        else:
-            await update.message.reply_text("⚠️ Unknown entity type.")
-    except Exception as exc:
-        await update.message.reply_text(f"⚠️ Delete failed: {exc}")
-
-    context.user_data["state"] = "idle"
-    context.user_data.pop("reply_delete", None)
-
-
-# ── REPLY-BASED UPDATE HANDLER ──────────────────────────────────────────────
-
-async def _reply_update_value(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Handle the update value from a reply-based update flow."""
-    data = context.user_data.get("reply_update")
-    if not data:
-        context.user_data["state"] = "idle"
-        await update.message.reply_text("⚠️ Nothing to update right now.")
-        return
-
-    entity_type = data["entity_type"]
-    entity_id = data["entity_id"]
-    text_stripped = text.strip()
-    text_lower = text_stripped.lower()
-
-    # Cancel
-    if text_lower in ("cancel", "stop", "nevermind"):
-        context.user_data["state"] = "idle"
-        context.user_data.pop("reply_update", None)
-        await update.message.reply_text("❌ Update cancelled.")
-        return
-
-    new_dt = nlp.extract_datetime(text_stripped)
-    title_prefix = re.match(r"^title:\s*(.+)$", text_stripped, re.IGNORECASE)
-    time_prefix = re.match(r"^time:\s*(.+)$", text_stripped, re.IGNORECASE)
-
-    try:
-        if entity_type == "task":
-            task = db.get_task(int(entity_id))
-            if not task:
-                await update.message.reply_text("⚠️ That task no longer exists.")
-                context.user_data["state"] = "idle"
-                context.user_data.pop("reply_update", None)
-                return
-
-            updates = {}
-            if time_prefix:
-                dt = nlp.extract_datetime(time_prefix.group(1))
-                if dt:
-                    updates["deadline"] = dt.date().isoformat()
-                else:
-                    await update.message.reply_text("Couldn't parse that time. Try `time: next Friday`.")
-                    return
-            elif title_prefix:
-                updates["title"] = title_prefix.group(1).strip().capitalize()
-            elif new_dt:
-                updates["deadline"] = new_dt.date().isoformat()
-            elif len(text_stripped) > 2:
-                updates["title"] = text_stripped
-
-            if updates:
-                db.update_task(task["id"], **updates)
-                if "title" in updates and task["calendar_event_id"]:
-                    try:
-                        calendar_client.update_event(task["calendar_event_id"], title=updates["title"])
-                    except Exception:
-                        pass
-                task = db.get_task(task["id"])
-                await update.message.reply_text(
-                    f"✏️ *Task Updated*\n\n{_fmt_entity('task', task)}"
-                    f"{_entity_ref_line('task', task['id'])}",
-                    parse_mode="Markdown",
-                )
-            else:
-                await update.message.reply_text("Couldn't parse that. Use `time: <datetime>` or `title: <new name>`.")
-                return
-
-        elif entity_type == "reminder":
-            reminder = db.get_reminder(int(entity_id))
-            if not reminder:
-                await update.message.reply_text("⚠️ That reminder no longer exists.")
-                context.user_data["state"] = "idle"
-                context.user_data.pop("reply_update", None)
-                return
-
-            if time_prefix:
-                dt = nlp.extract_datetime(time_prefix.group(1))
-                if dt:
-                    db.update_reminder(reminder["id"], remind_at=dt.isoformat())
-                else:
-                    await update.message.reply_text("Couldn't parse that time. Try `time: tomorrow 4pm`.")
-                    return
-            elif title_prefix:
-                db.update_reminder(reminder["id"], title=title_prefix.group(1).strip().capitalize())
-            elif new_dt:
-                db.update_reminder(reminder["id"], remind_at=new_dt.isoformat())
-            elif len(text_stripped) > 2:
-                db.update_reminder(reminder["id"], title=text_stripped)
-            else:
-                await update.message.reply_text("Couldn't parse that. Use `time: <datetime>` or `title: <new name>`.")
-                return
-
-            reminder = db.get_reminder(reminder["id"])
-            await update.message.reply_text(
-                f"✅ *Reminder Updated*\n\n{_fmt_entity('reminder', reminder)}"
-                f"{_entity_ref_line('reminder', reminder['id'])}",
-                parse_mode="Markdown",
-            )
-
-        elif entity_type == "cal_event":
-            dt = new_dt
-            if time_prefix:
-                dt = nlp.extract_datetime(time_prefix.group(1))
-
-            if not dt:
-                await update.message.reply_text("Couldn't parse that time. Try `time: tomorrow 6pm`.")
-                return
-
-            try:
-                dur = calendar_client.reschedule_event(entity_id, dt)
-                end = dt + timedelta(minutes=dur)
-                db.update_task_schedule_by_event(entity_id, dt.isoformat(), end.isoformat())
-                await update.message.reply_text(
-                    f"✅ *Calendar Event Updated*\n\n"
-                    f"New time: {_fmt_dt(dt)} → {end.strftime('%I:%M %p')}"
-                    f"{_entity_ref_line('cal_event', entity_id)}",
-                    parse_mode="Markdown",
-                )
-            except Exception as exc:
-                await update.message.reply_text(f"⚠️ Couldn't update calendar event: {exc}")
-
-        else:
-            await update.message.reply_text("⚠️ Unknown entity type.")
-
-    except Exception as exc:
-        await update.message.reply_text(f"⚠️ Update failed: {exc}")
-
-    context.user_data["state"] = "idle"
-    context.user_data.pop("reply_update", None)
-
-
-# ── UPDATE ─────────────────────────────────────────────────────────────────────
-
-async def _update_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    raw       = parsed["raw"]
-    numbers   = [int(n) for n in re.findall(r"\d+", raw)]
-    last_list = context.user_data.get("last_task_list", [])
-
-    if not numbers:
-        await update.message.reply_text("Which task? E.g. `update task 1 deadline to Monday`")
-        return
-
-    n       = numbers[0]
-    task_id = last_list[n - 1]["id"] if (last_list and 1 <= n <= len(last_list)) else n
-    task    = db.get_task(task_id)
-
-    if not task:
-        await update.message.reply_text(f"Task #{task_id} not found.")
-        return
-
-    updates = {}
-
-    rename = re.search(r"\brename\b.{0,10}\bto\s+(.+)$", raw, re.IGNORECASE)
-    if rename:
-        updates["title"] = rename.group(1).strip().capitalize()
-
-    if any(w in raw.lower() for w in ("deadline", "due", "move", "reschedule", "by", "to")):
-        clean = re.sub(r"\b(update|edit|change|move|reschedule|task|deadline|due|to|by)\b", " ", raw, flags=re.IGNORECASE)
-        clean = re.sub(r"\b\d+\b", " ", clean)
-        dt    = nlp.extract_datetime(clean)
-        if dt:
-            updates["deadline"] = dt.date().isoformat()
-
-    if updates:
-        db.update_task(task_id, **updates)
-        if "title" in updates and task["calendar_event_id"]:
-            try:
-                calendar_client.update_event(task["calendar_event_id"], title=updates["title"])
-            except Exception:
-                pass
-        lines = []
-        if "title"    in updates: lines.append(f"Title → {updates['title']}")
-        if "deadline" in updates: lines.append(f"Deadline → {_fmt_deadline(updates['deadline'])}")
-        await update.message.reply_text(
-            f"✏️ Updated *{task['title']}*:\n" + "\n".join(lines),
-            parse_mode="Markdown",
-        )
-    else:
-        context.user_data["state"]             = "updating"
-        context.user_data["pending_update_id"] = task_id
-        await update.message.reply_text(
-            f"✏️ Updating *{task['title']}*\n\n"
-            "What to change?\n"
-            "• New deadline — e.g. `next Monday`\n"
-            "• Rename — e.g. `rename: New Title`",
-            parse_mode="Markdown",
-        )
-
-
-async def _update_value(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    task_id = context.user_data.get("pending_update_id")
-    task    = db.get_task(task_id)
+    task = db.get_task(task_id)
     if not task:
         await update.message.reply_text("Task not found.")
         context.user_data["state"] = "idle"
         return
-
-    updates = {}
-    if text.lower().startswith("rename:"):
-        updates["title"] = text[7:].strip().capitalize()
-    else:
+    if field == "deadline":
         dt = nlp.extract_datetime(text)
         if dt:
-            updates["deadline"] = dt.date().isoformat()
-
-    if not updates:
-        await update.message.reply_text(
-            "Couldn't parse that. Try `next Monday` or `rename: New Title`.\nOr /cancel."
-        )
-        return
-
-    db.update_task(task_id, **updates)
-    lines = []
-    if "title"    in updates: lines.append(f"Title → {updates['title']}")
-    if "deadline" in updates: lines.append(f"Deadline → {_fmt_deadline(updates['deadline'])}")
-    await update.message.reply_text("✏️ Updated:\n" + "\n".join(lines))
+            db.update_task(task_id, deadline=dt.date().isoformat())
+            await update.message.reply_text(
+                f"✏️ Updated deadline for *{task['title']}*: {_fmt_deadline(dt.date().isoformat())}"
+                f"{_entity_ref_line('task', task_id)}",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text("Couldn't parse that date.")
     context.user_data["state"] = "idle"
-    context.user_data.pop("pending_update_id", None)
+
+
+# ── RESCHEDULE ─────────────────────────────────────────────────────────────────
+
+
+async def _reschedule_intent(update, context, parsed):
+    """Handle ``"reschedule"`` intent — move a calendar event to a new time.
+
+    Searches for events matching the task title and lets the user pick.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
+    raw = parsed.get("raw", "")
+    m   = re.search(r"move\s+(?:task\s+)?(\d+)", raw, re.IGNORECASE)
+    if m:
+        task_id = int(m.group(1))
+        task = db.get_task(task_id)
+        if task and task["calendar_event_id"]:
+            event = calendar_client.get_event(task["calendar_event_id"])
+            if event:
+                new_dt = parsed.get("datetime")
+                if new_dt:
+                    await _do_reschedule(update, event, new_dt)
+                else:
+                    context.user_data["reschedule_event"] = event
+                    context.user_data["state"] = "reschedule_time"
+                    await update.message.reply_text(
+                        f"New time for *{event.get('summary','Event')}*? (e.g. `tomorrow 6pm`)",
+                        parse_mode="Markdown",
+                    )
+                return
+    await update.message.reply_text("Which event? Try `move task 1 to next Thursday`.")
+
+
+async def _do_reschedule(update, event, new_dt):
+    """Execute a calendar event reschedule.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        event: The Google Calendar event dict.
+        new_dt: The new start datetime.
+    """
+    event_id = event["id"]
+    try:
+        dur = calendar_client.reschedule_event(event_id, new_dt)
+        end = new_dt + timedelta(minutes=dur)
+        db.update_task_schedule_by_event(event_id, new_dt.isoformat(), end.isoformat())
+        await update.message.reply_text(
+            f"✅ *Calendar Event Updated*\n\n"
+            f"*{event.get('summary','Event')}*\n"
+            f"📍 {_fmt_dt(new_dt)} → {end.strftime('%I:%M %p')} ({dur} min)"
+            f"{_entity_ref_line('cal_event', event_id)}",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Couldn't update event: {exc}")
 
 
 # ── HABITS ─────────────────────────────────────────────────────────────────────
 
-async def _habit_add(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
+
+async def _habit_add(update, context, parsed):
+    """Handle ``"habit_add"`` intent — create a new habit.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
     title     = parsed.get("title", "").strip()
-    frequency = parsed.get("frequency", "weekly")
+    frequency = parsed.get("frequency", "daily")
     count     = parsed.get("count", 1)
     notes     = parsed.get("notes")
-
     if not title or len(title) < 2:
-        await update.message.reply_text(
-            "What's the habit?\n\n"
-            "Weekly habits (shown every Sunday):\n"
-            "• `add weekly habit: gym 2 times`\n"
-            "• `add weekly habit: running 4 times`\n\n"
-            "Daily habits (shown every morning):\n"
-            "• `add daily habit: read 30 min`\n"
-            "• `add daily habit: cold shower`"
-        )
+        await update.message.reply_text("What habit? E.g. `add daily habit: read 30 min`")
         return
-
-    habit_id  = db.add_habit(title=title, frequency=frequency, count=count, notes=notes)
-    freq_desc = "every morning" if frequency == "daily" else "every Sunday"
-    count_str = f" — {count}x per week" if frequency == "weekly" and count > 1 else ""
-    note_str  = f" ({notes})" if notes else ""
-
+    habit_id = db.add_habit(title, frequency, count, notes)
+    freq_label = "daily" if frequency == "daily" else f"{count}x/week"
     await update.message.reply_text(
-        f"🔁 *Habit added!*\n\n"
-        f"*{title}*{note_str}{count_str}\n"
-        f"Reminder: {freq_desc} at planning time\n"
-        f"ID: #{habit_id}",
+        f"✅ *Habit added!*\n\n{title} — {freq_label}\nID: #{habit_id}"
+    )
+
+
+async def _habit_delete(update, context, parsed):
+    """Handle ``"habit_delete"`` intent — delete a habit by ID.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
+    raw = parsed.get("raw", "")
+    m   = re.search(r"delete\s+habit\s+(\d+)", raw, re.IGNORECASE)
+    if m:
+        habit_id = int(m.group(1))
+        habit = db.delete_habit(habit_id)
+        if habit:
+            await update.message.reply_text(f"🗑 Deleted habit *{habit['title']}*", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("Habit not found.")
+    else:
+        await update.message.reply_text("Which habit? E.g. `delete habit 1`")
+
+
+# ── REMINDERS ──────────────────────────────────────────────────────────────────
+
+
+async def _reminder_intent(update, context, parsed):
+    """Handle ``"reminder"`` intent — create a bot-side reminder.
+
+    If a datetime was provided, creates the reminder immediately. Otherwise
+    enters ``reminder_time`` state to collect the time.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
+    title      = parsed.get("title", "Reminder").strip()
+    dt         = parsed.get("datetime")
+    recurrence = parsed.get("recurrence")
+    if not title:
+        await update.message.reply_text("What should I remind you about?")
+        return
+    if dt:
+        await _do_create_reminder(update, title, dt, recurrence)
+    else:
+        context.user_data["pending_reminder"] = {"title": title, "recurrence": recurrence}
+        context.user_data["state"] = "reminder_time"
+        await update.message.reply_text(f"⏰ *{title}*\n\nWhen? (e.g. `tomorrow 4pm`, `Monday 9am`)", parse_mode="Markdown")
+
+
+async def _do_create_reminder(update, title, dt, recurrence=None):
+    """Create a bot-side reminder and store it in the database.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        title: Reminder text.
+        dt: The trigger datetime.
+        recurrence: Optional RRULE dict.
+    """
+    rrule = recurrence["rrule"] if recurrence else None
+    rid   = db.add_reminder(title, dt.isoformat(), rrule)
+    recur_tag = f" ({recurrence['summary']})" if recurrence else ""
+    await update.message.reply_text(
+        f"✅ *Reminder set!*\n\n🔔 {title}\n🕐 {_fmt_dt(dt)}{recur_tag}"
+        f"{_entity_ref_line('reminder', rid)}",
         parse_mode="Markdown",
     )
 
 
-async def _habit_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    numbers = [int(n) for n in re.findall(r"\d+", parsed["raw"])]
-    if not numbers:
-        await update.message.reply_text("Which habit? E.g. `delete habit 2` — see /habits for the list.")
-        return
+# ── REPLY-TO-EDIT CONFIRMATIONS ────────────────────────────────────────────────
 
-    habits = db.get_habits(active_only=True)
-    n      = numbers[0]
-    if 1 <= n <= len(habits):
-        habit = db.delete_habit(habits[n - 1]["id"])
-        await update.message.reply_text(f"🗑 Deleted habit: *{habit['title']}*", parse_mode="Markdown")
+
+async def _reply_delete_confirm(update, context, text):
+    """Handle confirmation for reply-to-delete flow.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        text: User's reply text.
+    """
+    if text.lower().strip() in ("yes", "y", "ok", "✅"):
+        info = context.user_data.pop("reply_delete", {})
+        entity_type = info.get("entity_type")
+        entity_id   = info.get("entity_id")
+        if entity_type == "task":
+            task = db.delete_task(int(entity_id))
+            await update.message.reply_text(f"🗑 Deleted *{task['title']}*" if task else "⚠️ Not found.", parse_mode="Markdown")
+        elif entity_type == "reminder":
+            rem = db.delete_reminder(int(entity_id))
+            await update.message.reply_text(f"🗑 Deleted reminder *{rem['title']}*" if rem else "⚠️ Not found.", parse_mode="Markdown")
+        elif entity_type == "cal_event":
+            try:
+                calendar_client.delete_event(entity_id)
+                await update.message.reply_text("🗑 Deleted calendar event.")
+            except Exception:
+                await update.message.reply_text("⚠️ Couldn't delete event.")
     else:
-        await update.message.reply_text("That number doesn't match. Check /habits.")
+        await update.message.reply_text("Cancelled.")
+    context.user_data["state"] = "idle"
 
 
-# ── RESCHEDULE ────────────────────────────────────────────────────────────────
+async def _reply_update_value(update, context, text):
+    """Handle user's input during reply-to-update flow.
 
-async def _reschedule_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        text: User's reply text.
     """
-    Natural rescheduling: find a calendar event by title and move it.
-    e.g. "reschedule my gym to tomorrow 6pm"
-         "move Tuesday standup to Wednesday same time"
-         "push my report session to Friday"
+    info = context.user_data.get("reply_update", {})
+    entity_type = info.get("entity_type")
+    entity_id   = info.get("entity_id")
+    if not entity_type or not entity_id:
+        await update.message.reply_text("No pending update.")
+        context.user_data["state"] = "idle"
+        return
+    new_dt = nlp.extract_datetime(text)
+    if entity_type == "task":
+        task = db.get_task(int(entity_id))
+        if not task:
+            await update.message.reply_text("⚠️ Task not found.")
+            context.user_data["state"] = "idle"
+            return
+        if new_dt:
+            db.update_task(task["id"], deadline=new_dt.date().isoformat())
+        else:
+            db.update_task(task["id"], title=text)
+        task = db.get_task(task["id"])
+        await update.message.reply_text(
+            f"✏️ *Task Updated*\n\n{_fmt_entity('task', task)}"
+            f"{_entity_ref_line('task', task['id'])}",
+            parse_mode="Markdown",
+        )
+    elif entity_type == "reminder":
+        if new_dt:
+            db.update_reminder(int(entity_id), remind_at=new_dt.isoformat())
+        else:
+            db.update_reminder(int(entity_id), title=text)
+        reminder = db.get_reminder(int(entity_id))
+        await update.message.reply_text(
+            f"✏️ *Reminder Updated*\n\n{_fmt_entity('reminder', reminder)}"
+            f"{_entity_ref_line('reminder', reminder['id'])}",
+            parse_mode="Markdown",
+        )
+    context.user_data["state"] = "idle"
+
+
+# ── FREE TIME / PLANNING ───────────────────────────────────────────────────────
+
+
+async def _free_time_intent(update, context, parsed):
+    """Handle ``"free_time"`` intent — show free calendar blocks.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
     """
-    raw   = parsed.get("raw", "")
-    title = parsed.get("title", "").strip()
-    dt    = parsed.get("datetime")
-
-    if not title:
-        await update.message.reply_text(
-            "Which event? E.g.\n"
-            "`reschedule gym to tomorrow 6pm`\n"
-            "`move standup to Wednesday same time`"
-        )
+    dur    = parsed.get("duration") or 60
+    days   = parsed.get("days", 7)
+    free   = smart_schedule.get_free_slots(days_ahead=days, min_duration_min=dur)
+    if not free:
+        await update.message.reply_text("No free slots found this week. Try a different period.")
         return
-
-    # Search calendar for matching events
-    try:
-        matches = calendar_client.search_events_by_title(title, days_ahead=14)
-    except Exception as exc:
-        await update.message.reply_text(f"⚠️ Couldn't search calendar: {exc}")
-        return
-
-    if not matches:
-        await update.message.reply_text(
-            f"Couldn't find *{title}* in your calendar (next 14 days).\n"
-            "Try a different name or check /calendar.",
-            parse_mode="Markdown",
-        )
-        return
-
-    # If multiple matches, ask which one
-    if len(matches) > 1:
-        lines = [f"Found {len(matches)} events matching *{title}*:\n"]
-        for i, e in enumerate(matches[:5]):
-            title = e.get('summary', '?')
-            lines.append(f"  {i+1}. *{title}* — {calendar_client.fmt_event_time_range(e)}")
-        lines.append("\nReply with the number to reschedule.")
-        context.user_data["state"]             = "reschedule_pick"
-        context.user_data["reschedule_matches"]= matches[:5]
-        context.user_data["reschedule_new_dt"] = dt
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-        return
-
-    # Single match
-    event = matches[0]
-    if not dt:
-        context.user_data["state"]              = "reschedule_time"
-        context.user_data["reschedule_event"]   = event
-        await update.message.reply_text(
-            f"📅 Moving *{event.get('summary','Event')}*\n"
-            f"Currently: {calendar_client.fmt_event_time(event)}\n\n"
-            "New time? (e.g. `tomorrow 6pm`, `Friday same time`)",
-            parse_mode="Markdown",
-        )
-        return
-
-    await _do_reschedule(update, event, dt)
+    msg = f"📅 *Free slots* (≥{dur} min):\n\n"
+    msg += smart_schedule.format_slots_for_display(free, limit=8)
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def _do_reschedule(update, event: dict, new_dt: datetime):
-    try:
-        dur = calendar_client.reschedule_event(event["id"], new_dt)
-        end = new_dt + timedelta(minutes=dur)
+async def _plan_tasks_intent(update, context, parsed):
+    """Handle ``"plan"`` intent — auto-suggest task placements.
 
-        db.update_task_schedule_by_event(event["id"], new_dt.isoformat(), end.isoformat())
+    Fetches unscheduled tasks and free slots, then builds a plan and shows
+    it with an accept option.
 
-        title = event.get("summary", "Event")
-        await update.message.reply_text(
-            f"✅ *Rescheduled!*\n\n"
-            f"*{title}*\n"
-            f"New time: {_fmt_dt(new_dt)} → {end.strftime('%I:%M %p')}",
-            parse_mode="Markdown",
-        )
-    except Exception as exc:
-        await update.message.reply_text(f"⚠️ Reschedule failed: {exc}")
-
-
-# ── REMINDER ──────────────────────────────────────────────────────────────────
-
-async def _reminder_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
     """
-    Create a lightweight reminder stored in SQLite and sent by the bot.
-    It does not block Google Calendar time.
+    tasks = db.get_plannable_tasks(limit=10)
+    if not tasks:
+        await update.message.reply_text("No unscheduled tasks to plan.")
+        return
+    free = smart_schedule.get_free_slots()
+    if not free:
+        await update.message.reply_text("No free slots available this week.")
+        return
+    plan = smart_schedule.build_task_plan(tasks, free, limit=6)
+    if not plan:
+        await update.message.reply_text("Couldn't fit tasks into this week's schedule.")
+        return
+    plan_text = smart_schedule.format_task_plan(plan)
+    context.user_data["last_plan"] = plan
+    context.user_data["state"] = "plan_confirm"
+    await update.message.reply_text(
+        f"📋 *Suggested Plan*\n\n{plan_text}\n\n"
+        "Reply `yes` to schedule all, or `schedule 1 3` to pick specific ones.",
+        parse_mode="Markdown",
+    )
+
+
+async def _plan_confirm(update, context, text):
+    """Handle user's confirmation of a suggested plan.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        text: User's reply text.
     """
-    title      = (parsed.get("title") or "").strip()
-    dt         = parsed.get("datetime")
-    recurrence = parsed.get("recurrence")
+    text_lower = text.lower().strip()
+    plan = context.user_data.get("last_plan", [])
+    if text_lower in ("yes", "y", "ok", "✅"):
+        created = 0
+        for item in plan:
+            task = item["task"]
+            try:
+                event_id = calendar_client.create_event(
+                    task["title"], item["start"],
+                    int((item["end"] - item["start"]).total_seconds() / 60),
+                )
+                db.update_task(task["id"],
+                    calendar_event_id=event_id,
+                    scheduled_start=item["start"].isoformat(),
+                    scheduled_end=item["end"].isoformat(),
+                    status="in_progress",
+                )
+                created += 1
+            except Exception:
+                pass
+        await update.message.reply_text(f"✅ Scheduled {created}/{len(plan)} tasks!")
+    else:
+        m = re.search(r"schedule\s+([\d\s,]+)", text_lower)
+        if m:
+            nums = re.findall(r"\d+", m.group(1))
+            for n in nums:
+                i = int(n) - 1
+                if 0 <= i < len(plan):
+                    item = plan[i]
+                    task = item["task"]
+                    try:
+                        event_id = calendar_client.create_event(
+                            task["title"], item["start"],
+                            int((item["end"] - item["start"]).total_seconds() / 60),
+                        )
+                        db.update_task(task["id"],
+                            calendar_event_id=event_id,
+                            scheduled_start=item["start"].isoformat(),
+                            scheduled_end=item["end"].isoformat(),
+                            status="in_progress",
+                        )
+                    except Exception:
+                        pass
+            await update.message.reply_text(f"✅ Selected tasks scheduled!")
+        else:
+            await update.message.reply_text("Cancelled.")
+    context.user_data["state"] = "idle"
 
-    if not title or len(title) < 2:
-        await update.message.reply_text(
-            "What should I remind you about?\n"
-            "E.g. `remind me tomorrow 4pm to check results`"
-        )
-        return
 
-    if not dt:
-        # Ask for time
-        context.user_data["state"]            = "reminder_time"
-        context.user_data["pending_reminder"] = {"title": title, "recurrence": recurrence}
-        await update.message.reply_text(
-            f"⏰ Reminder: *{title}*\n\nWhen? (e.g. `tomorrow 4pm`, `Monday 9am`, `in 2 hours`)",
-            parse_mode="Markdown",
-        )
-        return
-
-    await _do_create_reminder(update, title, dt, recurrence)
+# ── CALENDAR QUERY ─────────────────────────────────────────────────────────────
 
 
-async def _do_create_reminder(update, title: str, dt: datetime, recurrence=None):
-    try:
-        rrule    = recurrence["rrule"] if recurrence else None
-        reminder_id = db.add_reminder(title=title, remind_at=dt.isoformat(), recurrence_rrule=rrule)
+async def _calendar_query(update, context, parsed):
+    """Handle ``"calendar_query"`` intent — answer questions about the schedule.
 
-        time_str  = dt.strftime("%a %b %d, %I:%M %p").lstrip("0")
-        recur_str = f"\n🔁 {recurrence['summary'].capitalize()}" if recurrence else ""
-        ref_line = _entity_ref_line("reminder", reminder_id)
-        await update.message.reply_text(
-            f"🔔 *Reminder set!*\n\n"
-            f"*{title}*\n"
-            f"{time_str}"
-            f"{recur_str}\n"
-            f"ID: #{reminder_id}"
-            f"{ref_line}",
-            parse_mode="Markdown",
-        )
-    except Exception as exc:
-        await update.message.reply_text(f"⚠️ Couldn't set reminder: {exc}")
+    Delegates to the LLM for natural-language calendar queries.
 
-
-# ── CALENDAR QUERY ────────────────────────────────────────────────────────────
-
-async def _calendar_query(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    query = parsed.get("query") or parsed.get("raw", "")
-    await update.message.reply_text("🔍 Let me check your calendar...", parse_mode="Markdown")
-    try:
-        events = calendar_client.list_upcoming_events(days=14)
-        tasks  = [dict(t) for t in db.get_all_tasks()]
-        answer = llm_client.answer_calendar_query(query, events, tasks)
-        await update.message.reply_text(f"📅 {answer}")
-    except Exception as exc:
-        await update.message.reply_text(f"⚠️ Couldn't query calendar: {exc}")
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
+    events = calendar_client.list_upcoming_events(days=7)
+    msg = llm_client.answer_calendar_query(parsed.get("raw", ""), events)
+    if msg:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Couldn't answer that. Try a simpler question.")
 
 
 # ── CLARIFY ────────────────────────────────────────────────────────────────────
 
-async def _handle_clarify(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict):
-    question = parsed.get("clarify", "Could you be more specific?")
-    context.user_data["state"]            = "clarifying"
+
+async def _handle_clarify(update, context, parsed):
+    """Handle ``"clarify"`` intent — ask the user for more information.
+
+    Enters ``clarifying`` state and saves the original message so it can be
+    re-parsed after the user answers.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        parsed: Parsed intent dict.
+    """
     context.user_data["clarify_original"] = parsed.get("raw", "")
-    await update.message.reply_text(f"🤔 {question}")
-
-
-# ── Callback query handler (for inline "Done" button) ─────────────────────────
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline keyboard button presses (e.g. 'Done' button on reminders)."""
-    if not _authorized(update):
-        return
-
-    query = update.callback_query
-    await query.answer()  # Acknowledge the button press
-
-    data = query.data
-    if data.startswith("done_task_"):
-        task_id = int(data.replace("done_task_", ""))
-        task = db.get_task(task_id)
-        if not task:
-            await query.edit_message_text(
-                text=f"⚠️ Task #{task_id} no longer exists.",
-                parse_mode="Markdown",
-            )
-            return
-
-        db.complete_task(task_id)
-        title = task["title"]
-        await query.edit_message_text(
-            text=f"✅ *{title}* marked as done!",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("↩️ Undo", callback_data=f"undo_task_{task_id}")]
-            ]),
-        )
-        return
-
-    if data.startswith("undo_task_"):
-        task_id = int(data.replace("undo_task_", ""))
-        task = db.get_task(task_id)
-        if not task:
-            await query.edit_message_text(
-                text=f"⚠️ Task #{task_id} no longer exists.",
-                parse_mode="Markdown",
-            )
-            return
-
-        db.uncomplete_task(task_id)
-        title = task["title"]
-        await query.edit_message_text(
-            text=f"↩️ *{title}* reverted to pending!",
-            parse_mode="Markdown",
-        )
-        return
-
-    if data.startswith("plan_task_"):
-        task_id = int(data.replace("plan_task_", ""))
-        task = db.get_task(task_id)
-        if not task:
-            await query.edit_message_text(
-                text=f"⚠️ Task #{task_id} no longer exists.",
-                parse_mode="Markdown",
-            )
-            return
-
-        # Enter scheduling flow for this single task
-        context.user_data["state"]            = "scheduling"
-        context.user_data["pending_schedule"] = [task_id]
-        context.user_data["schedule_idx"]     = 0
-        context.user_data["last_task_list"]   = [
-            {"id": task["id"], "title": task["title"], "status": task.get("status", "pending"),
-             "priority": task.get("priority", "medium"), "deadline": task.get("deadline"),
-             "estimated_minutes": task.get("estimated_minutes", 60)}
-        ]
-
-        await query.edit_message_text(
-            text=f"📅 Starting scheduling for *{task['title']}*...",
-            parse_mode="Markdown",
-        )
-        await _ask_schedule_time(update, context)
-        return
-
-    # Unknown callback
-    await query.edit_message_text(
-        text="❓ Unknown action.",
-        parse_mode="Markdown",
+    context.user_data["state"] = "clarifying"
+    await update.message.reply_text(
+        parsed.get("question", "Could you clarify? What would you like to do?")
     )
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── INLINE CALLBACK HANDLER ───────────────────────────────────────────────────
 
-async def post_init(app):
-    scheduler = setup_scheduler(app)
-    scheduler.start()
-    logger.info("✅ Scheduler started")
+
+async def handle_callback(update, context):
+    """Handle inline keyboard button callbacks.
+
+    Supports:
+        - ``"undo_<task_id>"`` — uncomplete a task
+        - ``"plan_<task_id>"`` — schedule a specific task
+
+    Args:
+        update: The incoming Telegram update (containing callback query).
+        context: The callback context.
+    """
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("undo_"):
+        task_id = int(data.split("_")[1])
+        db.uncomplete_task(task_id)
+        await query.edit_message_text(f"↩️ Task #{task_id} reverted to pending.")
+    elif data.startswith("plan_"):
+        task_id = int(data.split("_")[1])
+        task = db.get_task(task_id)
+        if task:
+            context.user_data["pending_schedule"] = [task_id]
+            context.user_data["schedule_idx"]     = 0
+            context.user_data["state"]            = "scheduling"
+            await query.edit_message_text(f"🔄 Scheduling *{task['title']}*...", parse_mode="Markdown")
+            await _ask_schedule_time(update, context)
+
+
+# ── MAIN ───────────────────────────────────────────────────────────────────────
 
 
 def main():
-    if not TELEGRAM_TOKEN:
-        raise ValueError("TELEGRAM_TOKEN is not set.")
+    """Application entry point — build the bot, register handlers, and start
+    polling.
 
-    db.init_db()
+    Registers all command and message handlers, sets up the APScheduler
+    background jobs, and starts the Telegram long-polling loop.
+    """
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("help",     cmd_help))
-    app.add_handler(CommandHandler("tasks",    cmd_tasks))
-    app.add_handler(CommandHandler("today",    cmd_today))
+    # Command handlers
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("tasks",   cmd_tasks))
+    app.add_handler(CommandHandler("today",   cmd_today))
     app.add_handler(CommandHandler("tomorrow", cmd_tomorrow))
-    app.add_handler(CommandHandler("week",     cmd_week))
-    app.add_handler(CommandHandler("habits",   cmd_habits))
-    app.add_handler(CommandHandler("free",     cmd_free))
-    app.add_handler(CommandHandler("plan",     cmd_plan))
-    app.add_handler(CommandHandler("now",      cmd_now))
-    app.add_handler(CommandHandler("cancel",   cmd_cancel))
+    app.add_handler(CommandHandler("week",    cmd_week))
     app.add_handler(CommandHandler("reminders", cmd_reminders))
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CommandHandler("habits",  cmd_habits))
+    app.add_handler(CommandHandler("free",    cmd_free))
+    app.add_handler(CommandHandler("plan",    cmd_plan))
+    app.add_handler(CommandHandler("now",     cmd_now))
+    app.add_handler(CommandHandler("cancel",  cmd_cancel))
+
+    # Catch-all message handler (async, filters.TEXT)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("🤖 Bot is running...")
-    app.run_polling(drop_pending_updates=True)
+    # Callback query handler for inline buttons
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Initialise the database
+    db.init_db()
+
+    # Set up APScheduler background jobs
+    setup_scheduler(app)
+
+    # Start long polling
+    logger.info("Starting Planning Bot...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
