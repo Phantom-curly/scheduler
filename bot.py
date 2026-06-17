@@ -989,6 +989,9 @@ async def handle_message(update, context):
         else:
             await update.message.reply_text("Reply with the number of the event.")
         return
+    if state == "confirm_direct_event":
+        await _confirm_direct_event(update, context, text)
+        return
     if state == "confirm_schedule":
         await _confirm_schedule(update, context, text)
         return
@@ -1420,20 +1423,22 @@ async def _schedule_direct_intent(update, context, parsed):
     dur   = parsed.get("duration") or 60
     context.user_data["scheduling_direct"] = {"title": title, "duration": dur}
     if dt:
-        # User provided time inline — create the event directly, no confirmation needed
-        try:
-            event_id = calendar_client.create_event(title, dt, dur)
-            end = dt + timedelta(minutes=dur)
-            reminder_min = nlp.extract_reminder_minutes(title)
-            await update.message.reply_text(
-                f"✅ *Scheduled!*\n*{title}*\n"
-                f"📍 {_fmt_dt(dt)} → {end.strftime('%I:%M %p')} ({dur} min)\n"
-                f"⏰ Reminder: {reminder_min} min before"
-                f"{_entity_ref_line('cal_event', event_id)}",
-                parse_mode="Markdown",
-            )
-        except Exception as exc:
-            await update.message.reply_text(f"⚠️ Couldn't create calendar event: {exc}")
+        # User provided time inline — ask for confirmation first
+        end = dt + timedelta(minutes=dur)
+        context.user_data["pending_direct_event"] = {
+            "title": title,
+            "dt": dt,
+            "duration": dur,
+            "end": end,
+        }
+        context.user_data["state"] = "confirm_direct_event"
+        await update.message.reply_text(
+            f"📅 *Confirm schedule:*\n"
+            f"*{title}*\n"
+            f"📍 {_fmt_dt(dt)} → {end.strftime('%I:%M %p')} ({dur} min)\n\n"
+            "Reply `yes` to confirm, `no` to cancel, or a different time.",
+            parse_mode="Markdown",
+        )
         return
     else:
         free = smart_schedule.get_free_slots()
@@ -1491,6 +1496,83 @@ async def _schedule_direct_time(update, context, text):
         except Exception as exc:
             await update.message.reply_text(f"⚠️ Couldn't create event: {exc}")
         context.user_data["state"] = "idle"
+
+
+# ── CONFIRM DIRECT EVENT ───────────────────────────────────────────────────────
+
+
+async def _confirm_direct_event(update, context, text):
+    """Handle user's confirmation reply for a direct calendar event.
+
+    On ``"yes"``: creates the calendar event via ``calendar_client.create_event()``.
+    On ``"no"``: cancels and clears the pending data.
+    On any other text: tries to parse as a new datetime, updates the proposal,
+    and re-displays the confirmation.
+
+    Args:
+        update: The incoming Telegram update.
+        context: The callback context.
+        text: The user's reply text.
+    """
+    text_lower = text.lower().strip()
+    pending = context.user_data.get("pending_direct_event", {})
+
+    if text_lower in ("yes", "y", "ok", "✅"):
+        title    = pending.get("title", "Event")
+        dt       = pending.get("dt")
+        dur      = pending.get("duration", 60)
+        if not dt:
+            await update.message.reply_text("Something went wrong. Please try again.")
+            context.user_data["state"] = "idle"
+            return
+        try:
+            event_id = calendar_client.create_event(title, dt, dur)
+            end = dt + timedelta(minutes=dur)
+            reminder_min = nlp.extract_reminder_minutes(title)
+            await update.message.reply_text(
+                f"✅ *Scheduled!*\n*{title}*\n"
+                f"📍 {_fmt_dt(dt)} → {end.strftime('%I:%M %p')} ({dur} min)\n"
+                f"⏰ Reminder: {reminder_min} min before"
+                f"{_entity_ref_line('cal_event', event_id)}",
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            await update.message.reply_text(f"⚠️ Couldn't create calendar event: {exc}")
+        context.user_data.pop("pending_direct_event", None)
+        context.user_data["state"] = "idle"
+        return
+
+    if text_lower in ("no", "n", "cancel", "❌"):
+        await update.message.reply_text("Cancelled.")
+        context.user_data.pop("pending_direct_event", None)
+        context.user_data["state"] = "idle"
+        return
+
+    # Try to parse as a new datetime
+    new_dt = nlp.extract_datetime(text)
+    if not new_dt:
+        await update.message.reply_text(
+            "Reply `yes` to confirm, `no` to cancel, or a different time like `tomorrow 2pm`."
+        )
+        return
+
+    # Update the proposed time with the new datetime
+    dur   = pending.get("duration", 60)
+    title = pending.get("title", "Event")
+    end   = new_dt + timedelta(minutes=dur)
+    context.user_data["pending_direct_event"] = {
+        "title": title,
+        "dt": new_dt,
+        "duration": dur,
+        "end": end,
+    }
+    await update.message.reply_text(
+        f"📅 *Confirm schedule:*\n"
+        f"*{title}*\n"
+        f"📍 {_fmt_dt(new_dt)} → {end.strftime('%I:%M %p')} ({dur} min)\n\n"
+        "Reply `yes` to confirm, `no` to cancel, or a different time.",
+        parse_mode="Markdown",
+    )
 
 
 # ── COMPLETE TASKS ─────────────────────────────────────────────────────────────
