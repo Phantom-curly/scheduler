@@ -2220,8 +2220,10 @@ def main():
     # Initialise the database
     db.init_db()
 
-    # Set up APScheduler background jobs
-    setup_scheduler(app)
+    # Set up and start APScheduler background jobs
+    scheduler = setup_scheduler(app)
+    scheduler.start()
+    logger.info("Scheduler started with 9 background jobs.")
 
     # Start long polling
     logger.info("Starting Planning Bot...")
